@@ -102,7 +102,7 @@ func cmdGet(args []string) error {
 		ln := strings.ToLower(f.Name)
 		if f.Format == "Metadata" || strings.Contains(ln, "sample") ||
 			strings.Contains(ln, "_text.pdf") || strings.Contains(ln, "text_djvu") ||
-			strings.HasSuffix(ln, ".vbr") {
+			strings.Contains(ln, ".ia.mp4") || strings.HasSuffix(ln, ".vbr") {
 			continue
 		}
 		ext := strings.ToLower(filepath.Ext(f.Name))

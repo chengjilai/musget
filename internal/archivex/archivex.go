@@ -71,15 +71,35 @@ func tunedTransport(proxy string) *http.Transport {
 type Result struct {
 	Identifier     string   `json:"identifier"`
 	Title          string   `json:"title"`
-	Description    string   `json:"description"`
+	Description    any      `json:"description"`
 	Mediatype      string   `json:"mediatype"`
 	Collection     []string `json:"collection"`
 	DownloadCount  int      `json:"downloads"`
 	Year           any      `json:"year"`
-	Creator        string   `json:"creator"`
+	Creator        any      `json:"creator"`
 	AccessRestricted string `json:"access-restricted-item"`
 }
 
+
+// Str converts any archive.org scalar-or-array metadata field to a string.
+func (r *Result) Str(f any) string {
+	switch v := f.(type) {
+	case string:
+		return v
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, e := range v {
+			if s, ok := e.(string); ok {
+				parts = append(parts, s)
+			}
+		}
+		return strings.Join(parts, "; ")
+	case nil:
+		return ""
+	default:
+		return fmt.Sprint(v)
+	}
+}
 // Search queries advancedsearch.php.
 func (c *Client) Search(ctx context.Context, query string, limit int) ([]Result, error) {
 	if limit <= 0 {

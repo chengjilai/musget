@@ -122,7 +122,7 @@ func printArchiveResults(rs []archivex.Result) {
 		if r.AccessRestricted == "true" {
 			restricted = " [RESTRICTED]"
 		}
-		desc := strings.Join(strings.Fields(r.Description), " ")
+		desc := strings.Join(strings.Fields(r.Str(r.Description)), " ")
 		if len(desc) > 70 {
 			desc = desc[:70]
 		}
