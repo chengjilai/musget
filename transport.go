@@ -128,7 +128,7 @@ func probeOneRelay(ctx context.Context, base string) relayProbe {
 	u := base + "/https://archive.org/advancedsearch.php?q=date:[1900-01-01+TO+1901-01-01]&rows=1000&output=json"
 	cmd := exec.CommandContext(ctx, "curl", "-sS", "-g", "-o", "/dev/null",
 		"-w", "%{http_code} %{size_download} %{speed_download}",
-		"--connect-timeout", "5", "--max-time", "5", "-A", "curl",
+		"--connect-timeout", "5", "--max-time", "10", "-A", "curl",
 		"-r", "0-1048575", u)
 	out, err := cmd.Output()
 	if err != nil {

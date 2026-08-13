@@ -33,11 +33,15 @@ type RelaySet struct {
 	relays   []*Relay
 	next     int // round-robin cursor
 	Cooldown time.Duration
+	// SoftCooldown is used for transient relay misbehavior (HTTP 4xx/5xx
+	// rate-limit pages, speed-limit stalls): the relay is rotated off right
+	// away but may come back sooner than a hard connection-level failure.
+	SoftCooldown time.Duration
 }
 
 // NewRelaySet builds a set from relay base URLs (may be empty).
 func NewRelaySet(bases ...string) *RelaySet {
-	s := &RelaySet{Cooldown: 60 * time.Second}
+	s := &RelaySet{Cooldown: 60 * time.Second, SoftCooldown: 20 * time.Second}
 	for _, b := range bases {
 		b = strings.TrimRight(b, "/")
 		if b != "" {
@@ -87,6 +91,20 @@ func (s *RelaySet) MarkBad(base string) {
 	for _, r := range s.relays {
 		if r.Base == base {
 			r.markBadLocked(s.Cooldown)
+		}
+	}
+}
+
+// MarkBadSoft puts a relay into a shorter cooldown (SoftCooldown): used for
+// transient failures like rate-limit pages and speed stalls so the relay
+// rotates off immediately but can recover before the hard-failure cooldown
+// expires.
+func (s *RelaySet) MarkBadSoft(base string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.relays {
+		if r.Base == base {
+			r.markBadLocked(s.SoftCooldown)
 		}
 	}
 }
@@ -198,11 +216,12 @@ func (c *CurlStreamer) resolve(ctx context.Context, r *Relay, rawURL string) (st
 		}
 	}
 	// A download URL must redirect (302) to a dn node. A 4xx/5xx status is a
-	// hard relay-level failure (rate-limit/error page) -> mark bad so retries
-	// prefer the other relay. A missing Location (e.g. a transient 200 with an
-	// error body) is left to the engine's retry loop, which recovers quickly.
+	// transient relay-level rate-limit/error page -> mark bad (soft) so retries
+	// prefer the other relay; the relay can recover after the short cooldown. A
+	// missing Location (e.g. a transient 200 with an error body) is left to the
+	// engine's retry loop, which recovers quickly.
 	if status != "" && (status[0] == '4' || status[0] == '5') {
-		c.Set.MarkBad(r.Base)
+		c.Set.MarkBadSoft(r.Base)
 		debugf("resolve BAD %s status=%s url=%s", r.Base, status, rawURL)
 		return "", fmt.Errorf("resolve %s: relay HTTP %s", rawURL, status)
 	}
@@ -254,8 +273,18 @@ func (c *CurlStreamer) Fetch(ctx context.Context, rawURL, dest string, off int64
 		c.mu.Lock()
 		c.lastFail[rawURL] = r.Base
 		c.mu.Unlock()
-		if RelayHardFail(stderr.String()) {
-			c.Set.MarkBad(r.Base)
+		if RelayStalled(stderr.String()) {
+			// speed-limit abort: the relay is rate-limiting this stream, so
+			// rotate it off now (soft) instead of retrying the same relay; the
+			// engine's retry loop will pick another relay for the next attempt.
+			c.Set.MarkBadSoft(r.Base)
+			debugf("fetch STALL %s err=%v url=%s", r.Base, err, rawURL)
+		} else if RelayHardFail(stderr.String()) {
+			if RelayRateLimited(stderr.String()) {
+				c.Set.MarkBadSoft(r.Base)
+			} else {
+				c.Set.MarkBad(r.Base)
+			}
 		}
 		debugf("fetch ERR %s hard=%v err=%v stderr=%q url=%s", r.Base, RelayHardFail(stderr.String()), err, truncStr(stderr.String(), 120), rawURL)
 		return fmt.Errorf("curl %s: %v (%s)", truncStr(target, 60), err, truncStr(stderr.String(), 160))
@@ -300,6 +329,27 @@ func RelayHardFail(stderr string) bool {
 		}
 	}
 	return false
+}
+
+// RelayRateLimited reports whether a curl failure is specifically an HTTP
+// rate-limit / error-page response (4xx/5xx from the relay). These are
+// transient and clear quickly, so they use the shorter soft cooldown.
+func RelayRateLimited(stderr string) bool {
+	for _, code := range []string{"403", "404", "429", "500", "502", "503", "504"} {
+		if strings.Contains(stderr, "error: "+code) || strings.Contains(stderr, "HTTP "+code) ||
+			strings.Contains(stderr, "response code: "+code) {
+			return true
+		}
+	}
+	return false
+}
+
+// RelayStalled reports whether a curl failure is a speed-limit abort: the
+// transfer dropped below --speed-limit for --speed-time seconds, which on a
+// relay usually means per-IP rate-limiting kicked in. The engine reacts by
+// rotating the relay off immediately and retrying via another relay.
+func RelayStalled(stderr string) bool {
+	return strings.Contains(stderr, "too slow") || strings.Contains(stderr, "Operation too slow")
 }
 
 func truncStr(s string, n int) string {

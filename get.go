@@ -161,19 +161,20 @@ func cmdGet(args []string) error {
 		Verify:     *verify,
 		Quiet:      *quiet,
 		HTTP:       ac.HTTP,
-		MaxTries:   4,
+		MaxTries:   3,
 	}
 	// CORS relay handles parallel ranges well; default to segmented for big
 	// files unless the user chose otherwise. Transfers go through curl because
 	// the relay's Cloudflare rejects Go's TLS fingerprint.
 	if mode == modeCORS {
 		eng.Streamer = curlStreamer(bases)
+		eng.Adaptive = true
 		if !segmentsSet {
-			eng.Segments = 4
+			// size-bucket segment counts (8-40MB:2, >40MB:4, >120MB:6); the
+			// 25MB --segment-min default only applies when the user overrides it.
+			eng.SegAuto = true
 			if !segMinSet {
-				// benchmark mp3s (2-10MB) never hit the 25MB default, so
-				// moderately large files get segmented through the relay.
-				eng.SegmentMin = 8 << 20
+				eng.SegmentMin = 0
 			}
 		}
 	}
