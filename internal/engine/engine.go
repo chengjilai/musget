@@ -606,30 +606,36 @@ func (e *Engine) segmented(ctx context.Context, st *Stats, j Job, part string) e
 			f.Close()
 		}
 	}
-	// download each segment in parallel
+	// download each segment: on the curl relay path with --parallel support,
+	// ALL segments go through ONE curl -Z process (one resolve, one relay
+	// connection); otherwise fall back to per-segment parallel curl/Go fetches.
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var firstErr error
-	for _, sg := range segsList {
-		wg.Add(1)
-		go func(sg seg) {
-			defer wg.Done()
-			var err error
-			if direct {
-				err = e.segOneDirect(ctx, j, sg, part)
-			} else {
-				err = e.segOne(ctx, st, j, sg)
-			}
-			if err != nil {
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = err
+	if !direct && e.Streamer.SupportsParallel() {
+		firstErr = e.segBatch(ctx, j, segsList)
+	} else {
+		for _, sg := range segsList {
+			wg.Add(1)
+			go func(sg seg) {
+				defer wg.Done()
+				var err error
+				if direct {
+					err = e.segOneDirect(ctx, j, sg, part)
+				} else {
+					err = e.segOne(ctx, st, j, sg)
 				}
-				mu.Unlock()
-			}
-		}(sg)
+				if err != nil {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					mu.Unlock()
+				}
+			}(sg)
+		}
+		wg.Wait()
 	}
-	wg.Wait()
 	if firstErr != nil {
 		return firstErr
 	}
@@ -659,6 +665,60 @@ func (e *Engine) segmented(ctx context.Context, st *Stats, j Job, part string) e
 		os.Remove(sg.file)
 	}
 	return nil
+}
+
+// segBatch downloads ALL segments of one job in a single parallel curl
+// (CurlStreamer.FetchBatch): resolve once, then one curl -Z process streams
+// every segment from the same relay target. Any segment failure fails the
+// whole batch, which is retried with exponential backoff; segments that
+// already landed at their exact size are pruned on the next attempt (the
+// per-segment temp files are the resume unit, as in segOne). After MaxTries
+// the relay that served the job is rotated off via MarkBadFor.
+func (e *Engine) segBatch(ctx context.Context, j Job, segs []seg) error {
+	var lastErr error
+	for try := 0; try < e.MaxTries; try++ {
+		if try > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff(try)):
+			}
+		}
+		// prune complete segments, restart partial ones (curl cannot append)
+		specs := make([]SegSpec, 0, len(segs))
+		allDone := true
+		for _, sg := range segs {
+			want := sg.end - sg.start + 1
+			if fi, err := os.Stat(sg.file); err == nil && fi.Size() == want {
+				continue
+			}
+			os.Remove(sg.file)
+			allDone = false
+			specs = append(specs, SegSpec{Dest: sg.file, Rng: fmt.Sprintf("%d-%d", sg.start, sg.end)})
+		}
+		if allDone {
+			return nil
+		}
+		if err := e.Streamer.FetchBatch(ctx, j.URL, specs); err != nil {
+			lastErr = err
+			continue
+		}
+		// exact-size check: a segment that is short (cut stream) or oversize
+		// (server ignored the Range and sent the full body) is not complete
+		ok := true
+		for _, sg := range segs {
+			want := sg.end - sg.start + 1
+			if fi, err := os.Stat(sg.file); err != nil || fi.Size() != want {
+				ok = false
+				lastErr = fmt.Errorf("segment short %d-%d", sg.start, sg.end)
+			}
+		}
+		if ok {
+			return nil
+		}
+	}
+	e.Streamer.MarkBadFor(j.URL) // MaxTries exhausted -> rotate relay off
+	return lastErr
 }
 
 // segOne downloads one segment through the curl relay into its own temp file
