@@ -143,11 +143,23 @@ func (c *Client) get(ctx context.Context, u string, headers map[string]string) (
 	var lastErr error
 	for try := 0; try < c.MaxTries; try++ {
 		if try > 0 {
+			// exponential backoff: 3s, 6s, 12s, 24s, 48s ...
+			backoff := time.Duration(3) * time.Second
+			for i := 0; i < try; i++ {
+				backoff *= 2
+			}
+			if backoff > 3*time.Minute {
+				backoff = 3 * time.Minute
+			}
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(time.Duration(try+1) * 3 * time.Second):
+			case <-time.After(backoff):
 			}
+		}
+		// polite min-interval throttle (gallica rate-limits aggressively)
+		if try == 0 {
+			time.Sleep(1200 * time.Millisecond)
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
