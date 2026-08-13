@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"musget/internal/archivex"
-	"musget/internal/gallica"
-	"musget/internal/netx"
+	"musget/pkg/archivex"
+	"musget/pkg/gallica"
+	"musget/pkg/netx"
 )
 
 type commonOpts struct {

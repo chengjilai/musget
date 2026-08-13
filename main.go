@@ -29,6 +29,9 @@ Flags:
   --proxy URL                     proxy override (auto-detect if omitted)
   --relay BASE                    force CORS relay (URL or cors.sh/eu.org)
   --install                       organize under ~/Music/<Identifier>/
+  post-loop                       PD-gated auto download+repost loop (law+dedup)
+  post-seed ID[:Title] ...        queue candidates
+  post-status                     show the post queue
   -q, --quiet                     less output
 `
 
@@ -54,6 +57,12 @@ func main() {
 		err = cmdInfo(os.Args[2:])
 	case "get":
 		err = cmdGet(os.Args[2:])
+	case "post-loop":
+		err = cmdPostLoop(os.Args[2:])
+	case "post-status":
+		err = cmdPostStatus(os.Args[2:])
+	case "post-seed":
+		err = cmdPostSeed(os.Args[2:])
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 	default:

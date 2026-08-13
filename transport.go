@@ -11,10 +11,10 @@ import (
 	"sync"
 	"time"
 
-	"musget/internal/archivex"
-	"musget/internal/corsx"
-	"musget/internal/engine"
-	"musget/internal/netx"
+	"musget/pkg/archivex"
+	"musget/pkg/corsx"
+	"musget/pkg/engine"
+	"musget/pkg/netx"
 )
 
 type mode int

@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"musget/internal/corsx"
-	"musget/internal/netx"
+	"musget/pkg/corsx"
+	"musget/pkg/netx"
 )
 
 // probeResult is the connectivity matrix entry.

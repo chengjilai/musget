@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"musget/internal/engine"
-	"musget/internal/gallica"
+	"musget/pkg/engine"
+	"musget/pkg/gallica"
 )
 
 var audioExts = map[string]bool{".mp3": true, ".flac": true, ".ogg": true, ".oga": true, ".wav": true, ".m4a": true, ".aac": true}
