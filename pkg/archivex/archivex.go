@@ -3,6 +3,7 @@ package archivex
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -44,7 +45,9 @@ func tunedTransport(proxy string) *http.Transport {
 	var tr *http.Transport
 	if proxy != "" {
 		tr = &http.Transport{
-			ForceAttemptHTTP2:    true,
+			// HTTP/2 over a CONNECT proxy breaks on the smart-proxy (empty
+			// bodies); force HTTP/1.1 for proxy paths.
+			TLSNextProto:         map[string]func(string, *tls.Conn) http.RoundTripper{},
 			MaxIdleConns:         256,
 			MaxIdleConnsPerHost:  64,
 			IdleConnTimeout:      2 * time.Minute,

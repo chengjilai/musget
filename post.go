@@ -341,7 +341,9 @@ func cmdPostLoop(args []string) error {
 	noUpload := fs.Bool("no-upload", false, "download+encode only (upload from another machine)")
 	uploadOnly := fs.Bool("upload-only", false, "upload items already staged as videos (state+Videos/Post synced)")
 	state := fs.String("state", os.ExpandEnv("$HOME/.musget/repost-state.jsonl"), "state file")
+	videoDir := fs.String("video-dir", os.ExpandEnv("$HOME/Videos/Post"), "staged video directory")
 	quiet := fs.Bool("q", false, "quiet")
+	fs.StringVar(&proxyFlag, "proxy", "", "force egress: HTTP proxy URL (e.g. the lab tunnel :18888)")
 	fs.Parse(args)
 
 	st, err := loadState(*state)
@@ -380,7 +382,7 @@ func cmdPostLoop(args []string) error {
 			if it.Status != "downloaded" || it.BVID != "" {
 				continue
 			}
-			video := filepath.Join(os.ExpandEnv("$HOME/Videos/Post"), it.ID+".mp4")
+			video := filepath.Join(*videoDir, it.ID+".mp4")
 			if _, err := os.Stat(video); err != nil {
 				logf("    %s: staged video missing: %v", it.ID, err)
 				continue
@@ -389,7 +391,16 @@ func cmdPostLoop(args []string) error {
 			if title == "" {
 				title = it.ID
 			}
-			tags := "古典音乐,历史录音," + it.ID
+			tags := "古典音乐,历史录音"
+			for _, w := range strings.Fields(title) {
+				w = strings.Trim(w, "【】（）()[]——,.:。 ")
+				if len([]rune(w)) >= 2 && len([]rune(w)) <= 18 && !strings.Contains(tags, w) {
+					tags += "," + w
+					if strings.Count(tags, ",") >= 8 {
+						break
+					}
+				}
+			}
 			bvid, err := postUpload(uctx, video, title, "https://archive.org/details/"+it.ID, tags,
 				fmt.Sprintf("公有领域 (Public Domain) 历史录音 — 录音超过50年。\n来源: https://archive.org/details/%s", it.ID))
 			if err != nil {
@@ -545,7 +556,7 @@ func cmdPostLoop(args []string) error {
 			if creator == "" {
 				creator = truncStr(item.Title, 40)
 			}
-			out := filepath.Join(os.ExpandEnv("$HOME/Videos/Post"), it.ID+".mp4")
+			out := filepath.Join(*videoDir, it.ID+".mp4")
 			os.MkdirAll(filepath.Dir(out), 0o755)
 			if err := buildVideo(ctx, audioPaths, out, creator, title, fmt.Sprintf("recorded %d%s", year, labelSuffix(item))); err != nil {
 				it.Status, it.Reason = "failed", "video: "+err.Error()

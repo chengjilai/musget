@@ -14,7 +14,8 @@ import (
 
 // DefaultProxyCandidates tried in order when a host is unreachable directly.
 var DefaultProxyCandidates = []string{
-	"http://127.0.0.1:8888", // smart-proxy (WARP)
+	"http://127.0.0.1:8888",  // smart-proxy (WARP)
+	"http://127.0.0.1:18888", // lab-proxy-tunnel -> aturing smart-proxy (from lab)
 }
 
 // TunedTransport returns an *http.Transport optimized for many parallel
