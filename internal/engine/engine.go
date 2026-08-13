@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,6 +40,29 @@ type Engine struct {
 	HTTP       *http.Client
 	Streamer   *CurlStreamer // if set, transfers go through curl (relay path)
 	MaxTries   int
+	// SegAuto picks the segment count per file size when the user did not
+	// set --segments explicitly (8-40MB:2, >40MB:4, >120MB:6).
+	SegAuto bool
+	// Adaptive enables AIMD-lite pool sizing: start at Jobs, grow on rising
+	// throughput, halve on failures, bounded by [MinJobs, MaxJobs].
+	Adaptive bool
+	MinJobs  int
+	MaxJobs  int
+}
+
+// segmentsFor returns the auto segment count for a file of the given size
+// (0 = single stream). Buckets tuned so segment overhead (per-range resolve
+// + curl startup) stays small relative to transfer time.
+func segmentsFor(size int64) int {
+	switch {
+	case size >= 120<<20:
+		return 6
+	case size >= 40<<20:
+		return 4
+	case size >= 8<<20:
+		return 2
+	}
+	return 0
 }
 
 // Stats are aggregate transfer counters.
@@ -61,27 +85,78 @@ func (e *Engine) Run(ctx context.Context, jobs []Job) Stats {
 		e.Jobs = 8
 	}
 	if e.MaxTries <= 0 {
-		e.MaxTries = 4
+		e.MaxTries = 3
 	}
+	// largest first: big files start early so their tail latency hides behind
+	// the pool instead of extending the makespan.
+	sort.SliceStable(jobs, func(i, j int) bool { return jobs[i].Size > jobs[j].Size })
+
+	minJ, maxJ := e.Jobs, e.Jobs
+	if e.Adaptive {
+		minJ = e.MinJobs
+		if minJ <= 0 {
+			minJ = e.Jobs / 2
+		}
+		if minJ < 2 {
+			minJ = 2
+		}
+		if minJ > e.Jobs {
+			minJ = e.Jobs
+		}
+		maxJ = e.MaxJobs
+		if maxJ <= 0 {
+			maxJ = e.Jobs * 4
+		}
+		if maxJ < minJ {
+			maxJ = minJ
+		}
+		if maxJ > 64 {
+			maxJ = 64
+		}
+	}
+
 	jobCh := make(chan Job)
+	// outcomeCh carries per-job results to the coordinator (sized so workers
+	// never block on it, even after the coordinator stops draining).
+	outcomeCh := make(chan jobOutcome, len(jobs)+2*maxJ)
+
+	var adaptMu sync.Mutex
+	cur := int32(e.Jobs)
+	desired := int32(e.Jobs)
+	window := make([]jobOutcome, 0, aimdWindow)
+	var prevTp float64
+
 	var wg sync.WaitGroup
-	for i := 0; i < e.Jobs; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := range jobCh {
-				err := e.do(ctx, &st, j)
-				if err != nil {
-					st.Mu.Lock()
-					st.FilesBad++
-					st.Lines = append(st.Lines, fmt.Sprintf("FAIL %s: %v", j.Name, err))
-					st.Mu.Unlock()
-				} else {
-					st.FilesOK++
-				}
+	worker := func() {
+		defer wg.Done()
+		for j := range jobCh {
+			start := time.Now()
+			bytes, err := e.do(ctx, &st, j)
+			if err != nil {
+				st.Mu.Lock()
+				st.FilesBad++
+				st.Lines = append(st.Lines, fmt.Sprintf("FAIL %s: %v", j.Name, err))
+				st.Mu.Unlock()
+			} else {
+				st.FilesOK++
 			}
-		}()
+			outcomeCh <- jobOutcome{bytes: bytes, dur: time.Since(start), ok: err == nil}
+			if e.Adaptive {
+				adaptMu.Lock()
+				if cur > desired { // pool shrunk: this worker exits when idle
+					cur--
+					adaptMu.Unlock()
+					return
+				}
+				adaptMu.Unlock()
+			}
+		}
 	}
+	spawn := func() {
+		wg.Add(1)
+		go worker()
+	}
+
 	// progress ticker
 	done := make(chan struct{})
 	var tickerWG sync.WaitGroup
@@ -101,14 +176,82 @@ func (e *Engine) Run(ctx context.Context, jobs []Job) Stats {
 			}
 		}()
 	}
-	for _, j := range jobs {
+
+	for i := 0; i < e.Jobs; i++ {
+		spawn()
+	}
+
+	// coordinator: feed jobs, adapt the pool as outcomes arrive. The select
+	// interleaves dispatch with outcome handling so growth decisions happen
+	// while jobs are still queued.
+	sent := 0
+	received := 0
+	abort := false
+	adapt := func(out jobOutcome) {
+		if !e.Adaptive {
+			return
+		}
+		adaptMu.Lock()
+		defer adaptMu.Unlock()
+		window = append(window, out)
+		if len(window) > aimdWindow {
+			window = window[1:]
+		}
+		var tb int64
+		var td time.Duration
+		fails := 0
+		for _, w := range window {
+			tb += w.bytes
+			td += w.dur
+			if !w.ok {
+				fails++
+			}
+		}
+		tp := 0.0
+		if td > 0 {
+			tp = float64(tb) / 1e6 / td.Seconds()
+		}
+		rising := prevTp > 0 && tp > prevTp*1.05
+		prevTp = tp
+		if fails > 0 {
+			// AIMD multiplicative decrease on failure, bounded below
+			d := int(desired) / 2
+			if d < minJ {
+				d = minJ
+			}
+			desired = int32(d)
+			debugf("pool DEC desired=%d cur=%d (fail)", desired, cur)
+		} else if rising && len(window) >= aimdWindow && int(desired) < maxJ {
+			// additive increase only when throughput is rising and clean
+			desired++
+			debugf("pool INC desired=%d cur=%d tp=%.2f", desired, cur, tp)
+		}
+		// grow the pool toward desired while jobs remain to be dispatched
+		for cur < desired && !abort && sent < len(jobs) {
+			cur++
+			adaptMu.Unlock()
+			spawn()
+			adaptMu.Lock()
+		}
+	}
+	for sent < len(jobs) && !abort {
 		select {
-		case jobCh <- j:
+		case out := <-outcomeCh:
+			received++
+			adapt(out)
+		case jobCh <- jobs[sent]:
+			sent++
 		case <-ctx.Done():
-			break
+			abort = true
 		}
 	}
 	close(jobCh)
+	// drain the outcomes of jobs already handed to workers
+	for received < sent {
+		out := <-outcomeCh
+		received++
+		adapt(out)
+	}
 	wg.Wait()
 	close(done)
 	tickerWG.Wait()
@@ -127,6 +270,19 @@ func (e *Engine) Run(ctx context.Context, jobs []Job) Stats {
 	return st
 }
 
+// jobOutcome is one job's result, used by the adaptive pool (AIMD-lite).
+// bytes = bytes accounted for the job (full size on success, partial on
+// failure); ok = job succeeded.
+type jobOutcome struct {
+	bytes int64
+	dur   time.Duration
+	ok    bool
+}
+
+// aimdWindow is the sliding window of recent job results the adaptive pool
+// uses to estimate throughput and failure rate.
+const aimdWindow = 5
+
 func (e *Engine) render(st *Stats) {
 	el := st.elapsed()
 	secs := el.Seconds()
@@ -140,46 +296,78 @@ func (e *Engine) render(st *Stats) {
 }
 
 // do downloads one job to dest (via .part temp), verifying if requested.
-func (e *Engine) do(ctx context.Context, st *Stats, j Job) error {
+// Returns the bytes accounted for the job (full size on success, partial on
+// failure) so callers can count partial progress and feed the adaptive pool.
+func (e *Engine) do(ctx context.Context, st *Stats, j Job) (int64, error) {
 	if err := os.MkdirAll(filepath.Dir(j.Dest), 0o755); err != nil {
-		return err
+		return 0, err
 	}
 	// already complete?
 	if j.Size > 0 {
 		if fi, err := os.Stat(j.Dest); err == nil && fi.Size() == j.Size {
 			if e.Verify && (j.SHA1 != "" || j.MD5 != "") && e.check(j.Dest, j) {
-				return nil // complete & verified
+				return j.Size, nil // complete & verified
 			}
 			if !e.Verify {
-				return nil
+				return j.Size, nil
 			}
 		}
 	}
 	part := j.Dest + ".part"
-	if j.Size > 0 && e.Segments > 1 && j.Size >= e.SegmentMin {
+	segs := e.segsFor(j.Size)
+	if j.Size > 0 && segs > 1 && (e.SegmentMin <= 0 || j.Size >= e.SegmentMin) {
 		if err := e.segmented(ctx, st, j, part); err != nil {
-			return err
+			pb := partialBytes(part) // count partial bytes on abort
+			st.Bytes.Add(pb)
+			return pb, err
 		}
 	} else {
 		if err := e.single(ctx, st, j, part); err != nil {
-			return err
+			pb := partialBytes(part) // count partial bytes on abort
+			st.Bytes.Add(pb)
+			return pb, err
 		}
 	}
 	// verify final file
 	if e.Verify && (j.SHA1 != "" || j.MD5 != "") {
 		if !e.check(part, j) {
 			os.Remove(part)
-			return fmt.Errorf("checksum mismatch (sha1=%s md5=%s)", j.SHA1, j.MD5)
+			return 0, fmt.Errorf("checksum mismatch (sha1=%s md5=%s)", j.SHA1, j.MD5)
 		}
 	}
 	if err := os.Rename(part, j.Dest); err != nil {
-		return err
+		return 0, err
 	}
 	st.Bytes.Add(j.Size) // count verified bytes
 	if !e.Quiet {
 		fmt.Fprintf(os.Stderr, "\n  ok %-60s (%d MB)\n", trunc(j.Name, 60), j.Size/1e6)
 	}
-	return nil
+	return j.Size, nil
+}
+
+// segsFor returns the segment count for a file: explicit e.Segments when set
+// (or when SegAuto is off), otherwise the size-bucket default.
+func (e *Engine) segsFor(size int64) int {
+	if e.SegAuto {
+		return segmentsFor(size)
+	}
+	return e.Segments
+}
+
+// partialBytes sums the bytes on disk for a failed download: the .part file
+// plus any segment files still present after an aborted segmented transfer.
+func partialBytes(part string) int64 {
+	var total int64
+	if fi, err := os.Stat(part); err == nil {
+		total += fi.Size()
+	}
+	matches, _ := filepath.Glob(part + ".seg*")
+	for _, m := range matches {
+		if fi, err := os.Stat(m); err == nil {
+			total += fi.Size()
+		}
+	}
+	return total
 }
 
 func trunc(s string, n int) string {
@@ -189,7 +377,9 @@ func trunc(s string, n int) string {
 	return s[:n-1] + "…"
 }
 
-// single downloads one stream with resume.
+// single downloads one stream with resume. Retries use exponential backoff
+// (1s, 2s, 4s, ...) and the file aborts permanently after MaxTries
+// consecutive failures.
 func (e *Engine) single(ctx context.Context, st *Stats, j Job, part string) error {
 	off := int64(0)
 	if fi, err := os.Stat(part); err == nil {
@@ -201,7 +391,7 @@ func (e *Engine) single(ctx context.Context, st *Stats, j Job, part string) erro
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(time.Duration(try) * time.Second):
+			case <-time.After(backoff(try)):
 			}
 		}
 		if e.Streamer != nil {
@@ -256,6 +446,19 @@ func (e *Engine) single(ctx context.Context, st *Stats, j Job, part string) erro
 		e.Streamer.MarkBadFor(j.URL) // MaxTries exhausted -> rotate relay off
 	}
 	return lastErr
+}
+
+// backoff returns the retry delay before attempt try (1-indexed): 1s, 2s,
+// 4s, ... capped at 30s.
+func backoff(try int) time.Duration {
+	if try <= 1 {
+		return time.Second
+	}
+	d := time.Duration(1<<(try-1)) * time.Second
+	if d > 30*time.Second {
+		return 30 * time.Second
+	}
+	return d
 }
 
 // stream performs one ranged GET appending to part from offset off.
@@ -388,7 +591,11 @@ func (e *Engine) segOne(ctx context.Context, st *Stats, j Job, sg struct {
 		var lastErr error
 		for try := 0; try < e.MaxTries; try++ {
 			if try > 0 {
-				time.Sleep(time.Duration(try) * time.Second)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(backoff(try)):
+				}
 			}
 			if err := e.Streamer.Fetch(ctx, j.URL, sg.file, 0, rng); err != nil {
 				lastErr = err
@@ -407,7 +614,11 @@ func (e *Engine) segOne(ctx context.Context, st *Stats, j Job, sg struct {
 	var lastErr error
 	for try := 0; try < e.MaxTries; try++ {
 		if try > 0 {
-			time.Sleep(time.Duration(try) * time.Second)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff(try)):
+			}
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, j.URL, nil)
 		if err != nil {
