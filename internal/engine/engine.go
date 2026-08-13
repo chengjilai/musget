@@ -65,10 +65,11 @@ func segmentsFor(size int64) int {
 	return 0
 }
 
-// Stats are aggregate transfer counters.
+// Stats are aggregate transfer counters. FilesOK/FilesBad are atomic: the
+// 1 Hz progress ticker reads them (render) while workers increment them.
 type Stats struct {
-	FilesOK  int
-	FilesBad int
+	FilesOK  atomic.Int64
+	FilesBad atomic.Int64
 	Bytes    atomic.Int64
 	Start    time.Time
 	Mu       sync.Mutex
@@ -142,11 +143,11 @@ func (e *Engine) Run(ctx context.Context, jobs []Job) Stats {
 			bytes, err := e.do(ctx, &st, j)
 			if err != nil {
 				st.Mu.Lock()
-				st.FilesBad++
+				st.FilesBad.Add(1)
 				st.Lines = append(st.Lines, fmt.Sprintf("FAIL %s: %v", j.Name, err))
 				st.Mu.Unlock()
 			} else {
-				st.FilesOK++
+				st.FilesOK.Add(1)
 			}
 			outcomeCh <- jobOutcome{bytes: bytes, dur: time.Since(start), ok: err == nil}
 			if e.Adaptive {
@@ -264,7 +265,7 @@ func (e *Engine) Run(ctx context.Context, jobs []Job) Stats {
 		mbps = float64(b) / 1e6 / secs
 	}
 	fmt.Fprintf(os.Stderr, "\ndone: %d ok, %d bad, %.1f MB in %s (%.2f MB/s)\n",
-		st.FilesOK, st.FilesBad, float64(b)/1e6, el.Round(time.Millisecond), mbps)
+		st.FilesOK.Load(), st.FilesBad.Load(), float64(b)/1e6, el.Round(time.Millisecond), mbps)
 	return st
 }
 
@@ -347,7 +348,7 @@ func (e *Engine) render(st *Stats) {
 		mbps = float64(b) / 1e6 / secs
 	}
 	fmt.Fprintf(os.Stderr, "\r[%d ok / %d bad] %6.1f MB @ %6.2f MB/s  %s   ",
-		st.FilesOK, st.FilesBad, float64(b)/1e6, mbps, el.Round(time.Second))
+		st.FilesOK.Load(), st.FilesBad.Load(), float64(b)/1e6, mbps, el.Round(time.Second))
 }
 
 // do downloads one job to dest (via .part temp), verifying if requested.
@@ -388,6 +389,7 @@ func (e *Engine) do(ctx context.Context, st *Stats, j Job) (int64, error) {
 		if !e.check(part, j) {
 			os.Remove(part)
 			removeSegMetas(part)
+			removeSegFiles(part)
 			return 0, fmt.Errorf("checksum mismatch (sha1=%s md5=%s)", j.SHA1, j.MD5)
 		}
 	}
@@ -452,6 +454,12 @@ func (e *Engine) single(ctx context.Context, st *Stats, j Job, part string) erro
 	off := int64(0)
 	if fi, err := os.Stat(part); err == nil {
 		off = fi.Size()
+	}
+	// .part already holds the full size: skip the download entirely (avoids a
+	// spurious 416 + curl -f failure on a complete .part) and let do() run
+	// verify/rename on what we have.
+	if j.Size > 0 && off >= j.Size {
+		return nil
 	}
 	var lastErr error
 	for try := 0; try < e.MaxTries; try++ {
@@ -551,7 +559,15 @@ func (e *Engine) stream(ctx context.Context, st *Stats, j Job, part string, off 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	f, err := os.OpenFile(part, os.O_CREATE|os.O_WRONLY, 0o644)
+	flags := os.O_CREATE | os.O_WRONLY
+	if off > 0 && resp.StatusCode == http.StatusOK {
+		// Server ignored the Range header and sent the full body from 0:
+		// truncate the .part and restart cleanly instead of appending
+		// duplicated data on top of the existing bytes.
+		flags |= os.O_TRUNC
+		off = 0
+	}
+	f, err := os.OpenFile(part, flags, 0o644)
 	if err != nil {
 		return 0, err
 	}
@@ -599,6 +615,18 @@ func readSegMeta(meta string, want int64) int64 {
 
 func writeSegMeta(meta string, want, have int64) {
 	os.WriteFile(meta, []byte(fmt.Sprintf("%d %d\n", want, have)), 0o644)
+}
+
+// removeSegFiles deletes every per-segment temp file for a .part file
+// (part.seg0, part.seg1, ...). On the curl relay path these are the segment
+// data files that segOne/segBatch treat as valid when full-size; leaving them
+// behind after a checksum-mismatch or failed concat would make a retry
+// re-concatenate the same corrupt bytes forever.
+func removeSegFiles(part string) {
+	matches, _ := filepath.Glob(part + ".seg*")
+	for _, m := range matches {
+		os.Remove(m)
+	}
 }
 
 // removeSegMetas deletes every resume sidecar for a .part file.
@@ -701,7 +729,11 @@ func (e *Engine) segmented(ctx context.Context, st *Stats, j Job, part string) e
 		}
 		return nil
 	}
-	// curl relay path: concatenate the per-segment files in order
+	// curl relay path: concatenate the per-segment files in order. Clean up
+	// every seg file when the concat starts (deferred), so a failed concat can
+	// never leave full-size .segN files behind for a retry to treat as valid —
+	// safety over resume: a retry always re-downloads the segments.
+	defer removeSegFiles(part)
 	out, err := os.OpenFile(part, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err

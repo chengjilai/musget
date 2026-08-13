@@ -58,7 +58,7 @@ func cmdSearch(args []string) error {
 	fs.StringVar(&proxyFlag, "proxy", "", "proxy URL (or cors:<relay>)")
 	fs.StringVar(&relayFlag, "relay", "", "force CORS relay (URL or cors.sh/eu.org)")
 	fs.Parse(args[1:])
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(rootCtx, 120*time.Second)
 	defer cancel()
 
 	switch *src {
@@ -156,7 +156,7 @@ func cmdInfo(args []string) error {
 	if p == "" {
 		p = resolveProxy("archive.org")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(rootCtx, 60*time.Second)
 	defer cancel()
 	ac, m, bases, speeds, err := pickArchiveClient(ctx)
 	if err != nil {

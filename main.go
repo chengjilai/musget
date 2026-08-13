@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 )
 
 const usage = `musget — find & download music (archive.org, Gallica)
@@ -29,7 +32,14 @@ Flags:
   -q, --quiet                     less output
 `
 
+// rootCtx is canceled by SIGINT/SIGTERM so long-running commands (downloads,
+// probes) abort promptly: the engine's ctx.Done() paths and
+// exec.CommandContext kill curl children instead of leaving orphan curl
+// processes writing into .part files.
+var rootCtx, rootCancel = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+
 func main() {
+	defer rootCancel()
 	if len(os.Args) < 2 {
 		fmt.Print(usage)
 		os.Exit(1)

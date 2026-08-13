@@ -61,7 +61,7 @@ func cmdProbe(args []string) error {
 
 	// CORS relays: probe each with a 1MB ranged request, report speed and
 	// the chosen (fastest) one.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(rootCtx, 30*time.Second)
 	defer cancel()
 	probes := probeRelays(ctx, corsx.Bases)
 	fmt.Println("CORS relays (curl probe, 1MB ranged, 5s timeout):")

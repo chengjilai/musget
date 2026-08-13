@@ -31,7 +31,7 @@ func cmdGet(args []string) error {
 	segments := fs.Int("segments", 0, "split big files into N parallel ranges (0=off)")
 	segMin := fs.Int64("segment-min", 25<<20, "min bytes for segmented download")
 	verify := fs.Bool("verify", true, "verify checksums")
-	proxy := fs.String("proxy", "", "proxy URL")
+	fs.StringVar(&proxyFlag, "proxy", "", "proxy URL")
 	relay := fs.String("relay", "", "force CORS relay (URL or cors.sh/eu.org)")
 	install := fs.Bool("install", false, "organize under ~/Music/<Identifier>/")
 	quiet := fs.Bool("q", false, "quiet")
@@ -48,7 +48,7 @@ func cmdGet(args []string) error {
 	})
 	fs.Parse(args[1:])
 
-	ctx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
+	ctx, cancel := context.WithTimeout(rootCtx, 24*time.Hour)
 	defer cancel()
 
 	if out == nil || *out == "" {
@@ -58,11 +58,9 @@ func cmdGet(args []string) error {
 
 	// gallica ark?
 	if isArk(id) {
-		return getGallica(ctx, id, *out, *proxy, *quiet)
+		return getGallica(ctx, id, *out, proxyFlag, *quiet)
 	}
 
-	p := *proxy
-	_ = p
 	relayFlag = *relay
 	ac, mode, bases, speeds, err := pickArchiveClient(ctx)
 	if err != nil {
@@ -179,11 +177,11 @@ func cmdGet(args []string) error {
 		}
 	}
 	st := eng.Run(ctx, jobsList)
-	if st.FilesBad > 0 {
+	if st.FilesBad.Load() > 0 {
 		for _, l := range st.Lines {
 			fmt.Fprintln(os.Stderr, l)
 		}
-		return fmt.Errorf("%d file(s) failed", st.FilesBad)
+		return fmt.Errorf("%d file(s) failed", st.FilesBad.Load())
 	}
 	return nil
 }

@@ -76,8 +76,8 @@ func TestSegmentedDirectOffsetResume(t *testing.T) {
 	j := Job{Name: "out.bin", URL: srv.URL, Dest: dest, Size: int64(len(data)), MD5: md5hex}
 
 	st1 := eng.Run(context.Background(), []Job{j})
-	if st1.FilesOK != 0 || st1.FilesBad != 1 {
-		t.Fatalf("run1 should fail, got ok=%d bad=%d", st1.FilesOK, st1.FilesBad)
+	if st1.FilesOK.Load() != 0 || st1.FilesBad.Load() != 1 {
+		t.Fatalf("run1 should fail, got ok=%d bad=%d", st1.FilesOK.Load(), st1.FilesBad.Load())
 	}
 	if _, err := os.Stat(dest + ".part"); err != nil {
 		t.Fatalf(".part missing after failed run: %v", err)
@@ -90,7 +90,7 @@ func TestSegmentedDirectOffsetResume(t *testing.T) {
 	trunc = false
 	mu.Unlock()
 	st2 := eng.Run(context.Background(), []Job{j})
-	if st2.FilesOK != 1 || st2.FilesBad != 0 {
+	if st2.FilesOK.Load() != 1 || st2.FilesBad.Load() != 0 {
 		t.Fatalf("run2 failed: %v", st2.Lines)
 	}
 	got, err := os.ReadFile(dest)
@@ -156,14 +156,14 @@ func TestSingleStreamResume(t *testing.T) {
 	}
 	j := Job{Name: "out.bin", URL: srv.URL, Dest: dest, Size: int64(len(data)), MD5: md5hex}
 
-	if st := eng.Run(context.Background(), []Job{j}); st.FilesOK != 0 {
+	if st := eng.Run(context.Background(), []Job{j}); st.FilesOK.Load() != 0 {
 		t.Fatalf("run1 should fail")
 	}
 	mu.Lock()
 	trunc = false
 	mu.Unlock()
 	st := eng.Run(context.Background(), []Job{j})
-	if st.FilesOK != 1 {
+	if st.FilesOK.Load() != 1 {
 		t.Fatalf("run2 failed: %v", st.Lines)
 	}
 	got, err := os.ReadFile(dest)
@@ -202,7 +202,7 @@ func TestSegmentedDirectOffsetNoRange(t *testing.T) {
 	}
 	j := Job{Name: "out.bin", URL: srv.URL, Dest: dest, Size: int64(len(data)), MD5: md5hex}
 	st := eng.Run(context.Background(), []Job{j})
-	if st.FilesOK != 1 {
+	if st.FilesOK.Load() != 1 {
 		t.Fatalf("download failed: %v", st.Lines)
 	}
 	got, err := os.ReadFile(dest)

@@ -244,21 +244,49 @@ func (c *Client) solveAltcha(ctx context.Context, referer string) error {
 	})
 	b64 := base64.StdEncoding.EncodeToString(payload)
 	form := url.Values{"altchaPayload": {b64}}.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		Base+"/services/engine/search/altcha/verify", strings.NewReader(form))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36")
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Referer", referer)
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusFound {
+	var lastErr error
+	for try := 0; try < c.MaxTries; try++ {
+		if try > 0 {
+			// exponential backoff: 3s, 6s, 12s, 24s, 48s ...
+			backoff := time.Duration(3) * time.Second
+			for i := 0; i < try; i++ {
+				backoff *= 2
+			}
+			if backoff > 3*time.Minute {
+				backoff = 3 * time.Minute
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			Base+"/services/engine/search/altcha/verify", strings.NewReader(form))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36")
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Referer", referer)
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusFound {
+			resp.Body.Close()
+			return nil
+		}
+		// 429 and 5xx are transient rate-limit/server errors: retry with
+		// backoff. Other statuses (e.g. 403) are permanent.
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("altcha verify HTTP %d", resp.StatusCode)
+			continue
+		}
+		resp.Body.Close()
 		return fmt.Errorf("altcha verify HTTP %d", resp.StatusCode)
 	}
-	return nil
+	return lastErr
 }

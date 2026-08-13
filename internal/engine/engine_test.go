@@ -128,8 +128,8 @@ func TestAdaptivePool(t *testing.T) {
 		MaxTries: 3,
 	}
 	st := e.Run(ctx, jobs)
-	if st.FilesOK != len(jobs) || st.FilesBad != 0 {
-		t.Fatalf("files ok=%d bad=%d want ok=%d", st.FilesOK, st.FilesBad, len(jobs))
+	if st.FilesOK.Load() != int64(len(jobs)) || st.FilesBad.Load() != 0 {
+		t.Fatalf("files ok=%d bad=%d want ok=%d", st.FilesOK.Load(), st.FilesBad.Load(), len(jobs))
 	}
 	for i, sz := range sizes {
 		fi, err := os.Stat(filepath.Join(dir, fmt.Sprintf("f%d.bin", i)))
@@ -181,15 +181,15 @@ func TestAdaptivePoolShrink(t *testing.T) {
 		MaxTries: 2, // fail fast on the broken server
 	}
 	st := e.Run(ctx, jobs)
-	if st.FilesOK+st.FilesBad != len(jobs) {
-		t.Fatalf("jobs accounted ok=%d bad=%d want %d", st.FilesOK, st.FilesBad, len(jobs))
+	if st.FilesOK.Load()+st.FilesBad.Load() != int64(len(jobs)) {
+		t.Fatalf("jobs accounted ok=%d bad=%d want %d", st.FilesOK.Load(), st.FilesBad.Load(), len(jobs))
 	}
 	if gotHit.Load() == 0 {
 		t.Fatal("server never hit")
 	}
 	// engine must not hang even when a file fails permanently
-	if st.FilesBad == 0 {
-		t.Fatalf("expected failures against 500 server, got ok=%d", st.FilesOK)
+	if st.FilesBad.Load() == 0 {
+		t.Fatalf("expected failures against 500 server, got ok=%d", st.FilesOK.Load())
 	}
 }
 
@@ -217,8 +217,8 @@ func TestOrderingDesc(t *testing.T) {
 	}
 	e := &Engine{Jobs: 1, Verify: false, Quiet: true, HTTP: srv.Client(), MaxTries: 3}
 	st := e.Run(context.Background(), jobs)
-	if st.FilesBad != 0 {
-		t.Fatalf("bad=%d", st.FilesBad)
+	if st.FilesBad.Load() != 0 {
+		t.Fatalf("bad=%d", st.FilesBad.Load())
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -360,11 +360,11 @@ func TestAdaptivePoolFlaky(t *testing.T) {
 		MaxTries: 2,
 	}
 	st := e.Run(ctx, jobs)
-	if st.FilesOK+st.FilesBad != len(jobs) {
-		t.Fatalf("accounted ok=%d bad=%d want %d", st.FilesOK, st.FilesBad, len(jobs))
+	if st.FilesOK.Load()+st.FilesBad.Load() != int64(len(jobs)) {
+		t.Fatalf("accounted ok=%d bad=%d want %d", st.FilesOK.Load(), st.FilesBad.Load(), len(jobs))
 	}
-	if st.FilesBad == 0 || st.FilesOK == 0 {
-		t.Fatalf("flaky server should split outcomes, got ok=%d bad=%d", st.FilesOK, st.FilesBad)
+	if st.FilesBad.Load() == 0 || st.FilesOK.Load() == 0 {
+		t.Fatalf("flaky server should split outcomes, got ok=%d bad=%d", st.FilesOK.Load(), st.FilesBad.Load())
 	}
 }
 
@@ -377,8 +377,8 @@ func TestSegmentedConcatenation(t *testing.T) {
 	j := Job{Name: "big", URL: fmt.Sprintf("%s/?size=%d", srv.URL, 64<<20), Dest: filepath.Join(dir, "big"), Size: 64 << 20}
 	e := &Engine{Jobs: 4, Segments: 4, SegmentMin: 1, Verify: false, Quiet: true, HTTP: srv.Client(), MaxTries: 3}
 	st := e.Run(context.Background(), []Job{j})
-	if st.FilesBad != 0 {
-		t.Fatalf("bad=%d", st.FilesBad)
+	if st.FilesBad.Load() != 0 {
+		t.Fatalf("bad=%d", st.FilesBad.Load())
 	}
 	fi, err := os.Stat(j.Dest)
 	if err != nil || fi.Size() != 64<<20 {
@@ -401,7 +401,7 @@ func TestResume(t *testing.T) {
 	j := Job{Name: "done", URL: srv.URL, Dest: dest, Size: 1 << 20}
 	e := &Engine{Jobs: 2, Verify: false, Quiet: true, HTTP: srv.Client(), MaxTries: 3}
 	st := e.Run(context.Background(), []Job{j})
-	if st.FilesOK != 1 || st.FilesBad != 0 {
-		t.Fatalf("ok=%d bad=%d", st.FilesOK, st.FilesBad)
+	if st.FilesOK.Load() != 1 || st.FilesBad.Load() != 0 {
+		t.Fatalf("ok=%d bad=%d", st.FilesOK.Load(), st.FilesBad.Load())
 	}
 }

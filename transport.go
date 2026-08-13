@@ -260,7 +260,7 @@ func warpFallback(ctx context.Context, rawURL, dest string, off int64, rng strin
 	}
 	args := []string{"-sS", "-f", "-L", "--retry", "2", "--retry-delay", "2",
 		"--connect-timeout", "15", "--speed-limit", "1024", "--speed-time", "15",
-		"--max-time", "0", "-A", "curl", "-x", p, "-o", dest}
+		"--max-time", "1800", "-A", "curl", "-x", p, "-o", dest}
 	if off > 0 {
 		args = append(args, "-C", fmt.Sprint(off))
 	}

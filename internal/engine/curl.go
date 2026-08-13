@@ -258,7 +258,7 @@ type CurlStreamer struct {
 	Fallback func(ctx context.Context, rawURL, dest string, off int64, rng string) error
 
 	mu       sync.Mutex
-	cache    map[string]string // relayBase+"\x00"+archive.org URL -> resolved relay target
+	cache    map[string]string // raw archive.org URL -> dn-node Location (relay-independent)
 	lastFail map[string]string // archive.org URL -> relay base of last failed fetch
 
 	parallelOnce sync.Once
@@ -300,14 +300,14 @@ func NewCurlStreamer(bases ...string) *CurlStreamer {
 
 // resolve returns the relay-prefixed target URL for an archive.org URL via
 // relay r: it asks the relay for headers (no redirect), extracts Location,
-// and re-wraps it through the same relay. Cache is keyed per relay because
-// the wrapped target embeds the relay base.
+// and re-wraps it through the same relay. The cached dn-node Location is keyed
+// by rawURL only (the Location is relay-independent), so relay rotation reuses
+// the resolve instead of re-running the header round-trip per relay.
 func (c *CurlStreamer) resolve(ctx context.Context, r *Relay, rawURL string) (string, error) {
-	key := r.Base + "\x00" + rawURL
 	c.mu.Lock()
-	if v, ok := c.cache[key]; ok {
+	if loc, ok := c.cache[rawURL]; ok {
 		c.mu.Unlock()
-		return v, nil
+		return r.Base + "/" + loc, nil
 	}
 	c.mu.Unlock()
 
@@ -358,7 +358,7 @@ func (c *CurlStreamer) resolve(ctx context.Context, r *Relay, rawURL string) (st
 	}
 	target := r.Base + "/" + loc
 	c.mu.Lock()
-	c.cache[key] = target
+	c.cache[rawURL] = loc
 	c.mu.Unlock()
 	return target, nil
 }
@@ -383,7 +383,7 @@ func (c *CurlStreamer) Fetch(ctx context.Context, rawURL, dest string, off int64
 	}
 	args := []string{"-sS", "-f", "--retry", "2", "--retry-delay", "2",
 		"--connect-timeout", "15", "--speed-limit", "1024", "--speed-time", "15",
-		"--max-time", "0", "-A", c.UA, "-o", dest}
+		"--max-time", "1800", "-A", c.UA, "-o", dest}
 	if off > 0 {
 		args = append(args, "-C", fmt.Sprint(off))
 	}
@@ -416,10 +416,15 @@ func (c *CurlStreamer) Fetch(ctx context.Context, rawURL, dest string, off int64
 		debugf("fetch ERR %s hard=%v err=%v stderr=%q url=%s", r.Base, RelayHardFail(stderr.String()), err, truncStr(stderr.String(), 120), rawURL)
 		return fmt.Errorf("curl %s: %v (%s)", truncStr(target, 60), err, truncStr(stderr.String(), 160))
 	}
-	// Success with zero progress (empty response) is a transient relay glitch
-	// here: the engine detects the short download and retries, which usually
-	// recovers immediately. Persistent empties hit MaxTries exhaustion, which
-	// marks the relay bad via MarkBadFor.
+	// A "successful" transfer that produced ~0 bytes (empty body) is a relay
+	// glitch: don't NoteSuccess it or the relay stays "clean" on top while the
+	// engine's retries keep burning on it. Soft-mark it so the next attempt
+	// rotates elsewhere; the engine's short-download check handles the retry.
+	if fi, err := os.Stat(dest); err != nil || fi.Size() <= off {
+		c.Set.MarkBadSoft(r.Base)
+		debugf("fetch EMPTY %s url=%s", r.Base, rawURL)
+		return nil
+	}
 	c.Set.NoteSuccess(r.Base)
 	return nil
 }
@@ -534,7 +539,7 @@ func (b *batchServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	// Header guard: if the relay does not answer within 90s, abort. The body
 	// phase has its own stall watchdog below (no flat deadline, matching the
-	// single-stream path's --max-time 0).
+	// single-stream path's --max-time 1800).
 	hdDone := make(chan struct{})
 	go func() {
 		select {
