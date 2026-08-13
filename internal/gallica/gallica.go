@@ -42,7 +42,7 @@ func NewClient(proxy string) *Client {
 	}
 	return &Client{
 		HTTP:     &http.Client{Transport: tr, Jar: jar, Timeout: 300 * time.Second},
-		MaxTries: 5,
+		MaxTries: 8,
 	}
 }
 
@@ -176,7 +176,7 @@ func (c *Client) get(ctx context.Context, u string, headers map[string]string) (
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
 			resp.Body.Close()
-			lastErr = fmt.Errorf("429 Too Many Requests")
+			lastErr = fmt.Errorf("429 Too Many Requests (Gallica rate limit — retrying)")
 			continue // backoff
 		}
 		if resp.StatusCode != http.StatusOK {
