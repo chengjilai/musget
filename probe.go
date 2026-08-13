@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"time"
 
+	"musget/internal/corsx"
 	"musget/internal/netx"
 )
 
@@ -54,6 +56,28 @@ func cmdProbe(args []string) error {
 			status = "UNREACHABLE"
 		}
 		fmt.Printf("  %-22s %-10s via %s (HTTP %d)\n", r.label, status, r.via, r.code)
+	}
+	fmt.Println()
+
+	// CORS relays: probe each with a 1MB ranged request, report speed and
+	// the chosen (fastest) one.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	probes := probeRelays(ctx, corsx.Bases)
+	fmt.Println("CORS relays (curl probe, 1MB ranged, 5s timeout):")
+	if len(probes) == 0 {
+		fmt.Println("  (none reachable)")
+	} else {
+		for _, p := range probes {
+			status := "OK"
+			if !p.ok {
+				status = "UNREACHABLE"
+			}
+			fmt.Printf("  %-24s %-10s %6.2f MB/s\n", p.base, status, p.speed)
+		}
+		if probes[0].ok {
+			fmt.Printf("  chosen: %s (fastest)\n", probes[0].base)
+		}
 	}
 	fmt.Println()
 	fmt.Println("Recommended:")

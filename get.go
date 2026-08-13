@@ -32,8 +32,20 @@ func cmdGet(args []string) error {
 	segMin := fs.Int64("segment-min", 25<<20, "min bytes for segmented download")
 	verify := fs.Bool("verify", true, "verify checksums")
 	proxy := fs.String("proxy", "", "proxy URL")
+	relay := fs.String("relay", "", "force CORS relay (URL or cors.sh/eu.org)")
 	install := fs.Bool("install", false, "organize under ~/Music/<Identifier>/")
 	quiet := fs.Bool("q", false, "quiet")
+	// remember which flags the user actually set (for defaults)
+	segMinSet := false
+	segmentsSet := false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "segment-min":
+			segMinSet = true
+		case "segments":
+			segmentsSet = true
+		}
+	})
 	fs.Parse(args[1:])
 
 	ctx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
@@ -51,12 +63,13 @@ func cmdGet(args []string) error {
 
 	p := *proxy
 	_ = p
-	ac, mode, corsBase, err := pickArchiveClient(ctx)
+	relayFlag = *relay
+	ac, mode, bases, err := pickArchiveClient(ctx)
 	if err != nil {
 		return err
 	}
 	if mode == modeCORS {
-		ac.Fetch = curlFetch(corsBase)
+		ac.Fetch = curlFetch(bases)
 	}
 	it, err := ac.Item(ctx, id)
 	if err != nil {
@@ -154,11 +167,13 @@ func cmdGet(args []string) error {
 	// files unless the user chose otherwise. Transfers go through curl because
 	// the relay's Cloudflare rejects Go's TLS fingerprint.
 	if mode == modeCORS {
-		eng.Streamer = curlStreamer(corsBase)
-		if *segments == 0 {
+		eng.Streamer = curlStreamer(bases)
+		if !segmentsSet {
 			eng.Segments = 4
-			if *segMin <= 0 {
-				eng.SegmentMin = 15 << 20
+			if !segMinSet {
+				// benchmark mp3s (2-10MB) never hit the 25MB default, so
+				// moderately large files get segmented through the relay.
+				eng.SegmentMin = 8 << 20
 			}
 		}
 	}

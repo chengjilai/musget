@@ -24,6 +24,7 @@ Flags:
   --segment-min MB                min size to use segmented download (default 25)
   --verify                        verify sha1/md5 after download (default on)
   --proxy URL                     proxy override (auto-detect if omitted)
+  --relay BASE                    force CORS relay (URL or cors.sh/eu.org)
   --install                       organize under ~/Music/<Identifier>/
   -q, --quiet                     less output
 `

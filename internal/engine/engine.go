@@ -21,19 +21,19 @@ import (
 
 // Job is one file to download.
 type Job struct {
-	Name   string // display name
-	URL    string
-	Dest   string // final path
-	Size   int64  // expected size (0 = unknown)
-	MD5    string
-	SHA1   string
+	Name string // display name
+	URL  string
+	Dest string // final path
+	Size int64  // expected size (0 = unknown)
+	MD5  string
+	SHA1 string
 }
 
 // Engine downloads jobs with a worker pool.
 type Engine struct {
 	Jobs       int
-	Segments   int           // 0 = single stream
-	SegmentMin int64         // min bytes for segmentation
+	Segments   int   // 0 = single stream
+	SegmentMin int64 // min bytes for segmentation
 	Verify     bool
 	Quiet      bool
 	HTTP       *http.Client
@@ -252,6 +252,9 @@ func (e *Engine) single(ctx context.Context, st *Stats, j Job, part string) erro
 		}
 		_ = n
 	}
+	if e.Streamer != nil {
+		e.Streamer.MarkBadFor(j.URL) // MaxTries exhausted -> rotate relay off
+	}
 	return lastErr
 }
 
@@ -364,14 +367,16 @@ func (e *Engine) segmented(ctx context.Context, st *Stats, j Job, part string) e
 }
 
 // segOne downloads one segment; resumes by checking the partial segment size.
-func (e *Engine) segOne(ctx context.Context, st *Stats, j Job, sg struct{ start, end int64; file string }) error {
+func (e *Engine) segOne(ctx context.Context, st *Stats, j Job, sg struct {
+	start, end int64
+	file       string
+}) error {
 	want := sg.end - sg.start + 1
 	have := int64(0)
 	if fi, err := os.Stat(sg.file); err == nil {
 		have = fi.Size()
 	}
 	if have >= want {
-		st.Bytes.Add(want)
 		return nil
 	}
 	if e.Streamer != nil {
@@ -391,12 +396,12 @@ func (e *Engine) segOne(ctx context.Context, st *Stats, j Job, sg struct{ start,
 				continue
 			}
 			if fi, err := os.Stat(sg.file); err == nil && fi.Size() >= want {
-				st.Bytes.Add(want)
 				return nil
 			}
 			os.Remove(sg.file)
 			lastErr = fmt.Errorf("segment short %d-%d", sg.start, sg.end)
 		}
+		e.Streamer.MarkBadFor(j.URL) // MaxTries exhausted -> rotate relay off
 		return lastErr
 	}
 	var lastErr error

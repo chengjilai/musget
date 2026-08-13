@@ -56,18 +56,19 @@ func cmdSearch(args []string) error {
 	limit := fs.Int("limit", 20, "max results")
 	src := fs.String("source", "auto", "archive|gallica")
 	fs.StringVar(&proxyFlag, "proxy", "", "proxy URL (or cors:<relay>)")
+	fs.StringVar(&relayFlag, "relay", "", "force CORS relay (URL or cors.sh/eu.org)")
 	fs.Parse(args[1:])
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	switch *src {
 	case "auto", "archive":
-		ac, m, corsBase, err := pickArchiveClient(ctx)
+		ac, m, bases, err := pickArchiveClient(ctx)
 		if err != nil {
 			return err
 		}
 		if m == modeCORS {
-			ac.Fetch = curlFetch(corsBase)
+			ac.Fetch = curlFetch(bases)
 		}
 		fmt.Fprintf(os.Stderr, "[archive.org via %s]\n", m)
 		results, err := ac.Search(ctx, query, *limit)
@@ -157,9 +158,12 @@ func cmdInfo(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	ac, _, _, err := pickArchiveClient(ctx)
+	ac, m, bases, err := pickArchiveClient(ctx)
 	if err != nil {
 		return err
+	}
+	if m == modeCORS {
+		ac.Fetch = curlFetch(bases)
 	}
 	it, err := ac.Item(ctx, id)
 	if err != nil {

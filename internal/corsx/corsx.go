@@ -21,6 +21,29 @@ var Bases = []string{
 	"https://cors.eu.org",
 }
 
+// ShortNames maps --relay aliases to full relay base URLs.
+var ShortNames = map[string]string{
+	"cors.sh": "https://proxy.cors.sh",
+	"eu.org":  "https://cors.eu.org",
+}
+
+// CanonicalBase resolves a --relay value to a full base URL: full URLs pass
+// through (trailing slash trimmed), short aliases map via ShortNames.
+// Returns "" if the value is unrecognized.
+func CanonicalBase(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if strings.Contains(s, "://") {
+		return strings.TrimRight(s, "/")
+	}
+	if v, ok := ShortNames[s]; ok {
+		return v
+	}
+	return ""
+}
+
 // Transport wraps an inner transport and relays requests via base.
 type Transport struct {
 	Base    string
