@@ -169,6 +169,7 @@ func (e *Engine) do(ctx context.Context, st *Stats, j Job) error {
 	if e.Verify && (j.SHA1 != "" || j.MD5 != "") {
 		if !e.check(part, j) {
 			os.Remove(part)
+			removeSegMetas(part)
 			return fmt.Errorf("checksum mismatch (sha1=%s md5=%s)", j.SHA1, j.MD5)
 		}
 	}
@@ -187,6 +188,18 @@ func trunc(s string, n int) string {
 		return s
 	}
 	return s[:n-1] + "…"
+}
+
+// copyBytes copies src to dst with a pooled 1MB buffer. io.Copy defaults to
+// 32KB chunks; the larger buffer cuts syscalls and page-cache faults on the
+// write/verify hot paths. Buffers are shared between concurrent segment
+// writers via sync.Pool.
+var copyBufPool = sync.Pool{New: func() any { b := make([]byte, 1<<20); return &b }}
+
+func copyBytes(dst io.Writer, src io.Reader) (int64, error) {
+	bp := copyBufPool.Get().(*[]byte)
+	defer copyBufPool.Put(bp)
+	return io.CopyBuffer(dst, src, *bp)
 }
 
 // single downloads one stream with resume.
@@ -290,11 +303,66 @@ func (e *Engine) stream(ctx context.Context, st *Stats, j Job, part string, off 
 			return 0, err
 		}
 	}
-	n, err := io.Copy(f, resp.Body)
+	n, err := copyBytes(f, resp.Body)
 	return n, err
 }
 
-// segmented splits the file into N ranges downloaded in parallel.
+// seg is one byte range of a download.
+type seg struct {
+	idx        int
+	start, end int64
+	file       string // per-segment temp file (curl relay path)
+}
+
+// segMetaPath returns the resume-progress sidecar for a direct-offset
+// segment: the shared .part file's size can't tell per-segment progress when
+// N goroutines write it concurrently, so each segment records its own byte
+// count here (written after the data, so a crash can only under-report).
+func segMetaPath(part string, i int) string {
+	return fmt.Sprintf("%s.seg%d.meta", part, i)
+}
+
+// readSegMeta returns the bytes already written for this segment's range in
+// the shared .part file, or 0 if the sidecar is missing/stale (wrong job).
+func readSegMeta(meta string, want int64) int64 {
+	b, err := os.ReadFile(meta)
+	if err != nil {
+		return 0
+	}
+	var w, have int64
+	if _, err := fmt.Sscanf(string(b), "%d %d", &w, &have); err != nil {
+		return 0
+	}
+	if w != want || have < 0 || have > want {
+		return 0
+	}
+	return have
+}
+
+func writeSegMeta(meta string, want, have int64) {
+	os.WriteFile(meta, []byte(fmt.Sprintf("%d %d\n", want, have)), 0o644)
+}
+
+// removeSegMetas deletes every resume sidecar for a .part file.
+func removeSegMetas(part string) {
+	d := filepath.Dir(part)
+	base := filepath.Base(part)
+	ents, err := os.ReadDir(d)
+	if err != nil {
+		return
+	}
+	for _, en := range ents {
+		name := en.Name()
+		if strings.HasPrefix(name, base+".seg") && strings.HasSuffix(name, ".meta") {
+			os.Remove(filepath.Join(d, name))
+		}
+	}
+}
+
+// segmented splits the file into N ranges downloaded in parallel. On the Go
+// HTTP path each segment is written straight into the .part file at its byte
+// offset (no temp files, no concatenation pass); on the curl relay path curl
+// writes per-segment temp files (curl cannot seek) that are then concatenated.
 func (e *Engine) segmented(ctx context.Context, st *Stats, j Job, part string) error {
 	segs := e.Segments
 	if segs <= 0 {
@@ -308,23 +376,34 @@ func (e *Engine) segmented(ctx context.Context, st *Stats, j Job, part string) e
 		return e.single(ctx, st, j, part)
 	}
 	// build segments
-	type seg struct {
-		start, end int64
-		file       string
-	}
 	var segsList []seg
 	for i := 0; i < segs; i++ {
 		s := int64(i) * chunk
-		e := s + chunk - 1
+		en := s + chunk - 1
 		if i == segs-1 {
-			e = j.Size - 1
+			en = j.Size - 1
 		}
-		if s > e {
+		if s > en {
 			break
 		}
-		segsList = append(segsList, seg{s, e, fmt.Sprintf("%s.seg%d", part, i)})
+		segsList = append(segsList, seg{i, s, en, fmt.Sprintf("%s.seg%d", part, i)})
 	}
-	// download each segment (with per-segment resume via file size)
+	direct := e.Streamer == nil // Go HTTP path: assemble in-place
+	if direct {
+		// If the .part file is gone, any leftover sidecars describe data that
+		// no longer exists — start clean.
+		if _, err := os.Stat(part); os.IsNotExist(err) {
+			removeSegMetas(part)
+		}
+		// Pre-size .part (sparse) so concurrent range writes never contend on
+		// extending the file and the final size is fixed up-front. Cheap and
+		// safe: no blocks are allocated until a write lands there.
+		if f, err := os.OpenFile(part, os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+			f.Truncate(j.Size)
+			f.Close()
+		}
+	}
+	// download each segment in parallel
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var firstErr error
@@ -332,7 +411,13 @@ func (e *Engine) segmented(ctx context.Context, st *Stats, j Job, part string) e
 		wg.Add(1)
 		go func(sg seg) {
 			defer wg.Done()
-			if err := e.segOne(ctx, st, j, sg); err != nil {
+			var err error
+			if direct {
+				err = e.segOneDirect(ctx, j, sg, part)
+			} else {
+				err = e.segOne(ctx, st, j, sg)
+			}
+			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
 					firstErr = err
@@ -345,7 +430,14 @@ func (e *Engine) segmented(ctx context.Context, st *Stats, j Job, part string) e
 	if firstErr != nil {
 		return firstErr
 	}
-	// concatenate in order
+	if direct {
+		// all segments already sit at their final offsets: nothing to assemble
+		for _, sg := range segsList {
+			os.Remove(segMetaPath(part, sg.idx))
+		}
+		return nil
+	}
+	// curl relay path: concatenate the per-segment files in order
 	out, err := os.OpenFile(part, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
@@ -356,7 +448,7 @@ func (e *Engine) segmented(ctx context.Context, st *Stats, j Job, part string) e
 		if err != nil {
 			return err
 		}
-		if _, err := io.Copy(out, in); err != nil {
+		if _, err := copyBytes(out, in); err != nil {
 			in.Close()
 			return err
 		}
@@ -366,11 +458,10 @@ func (e *Engine) segmented(ctx context.Context, st *Stats, j Job, part string) e
 	return nil
 }
 
-// segOne downloads one segment; resumes by checking the partial segment size.
-func (e *Engine) segOne(ctx context.Context, st *Stats, j Job, sg struct {
-	start, end int64
-	file       string
-}) error {
+// segOne downloads one segment through the curl relay into its own temp file
+// (curl cannot seek into a shared file). Resume restarts the whole segment
+// because curl appends from 0.
+func (e *Engine) segOne(ctx context.Context, st *Stats, j Job, sg seg) error {
 	want := sg.end - sg.start + 1
 	have := int64(0)
 	if fi, err := os.Stat(sg.file); err == nil {
@@ -379,30 +470,40 @@ func (e *Engine) segOne(ctx context.Context, st *Stats, j Job, sg struct {
 	if have >= want {
 		return nil
 	}
-	if e.Streamer != nil {
-		// curl path: restart the whole segment on partial (curl cannot append)
-		if have > 0 {
-			os.Remove(sg.file)
+	// curl path: restart the whole segment on partial (curl cannot append)
+	if have > 0 {
+		os.Remove(sg.file)
+	}
+	rng := fmt.Sprintf("%d-%d", sg.start, sg.end)
+	var lastErr error
+	for try := 0; try < e.MaxTries; try++ {
+		if try > 0 {
+			time.Sleep(time.Duration(try) * time.Second)
 		}
-		rng := fmt.Sprintf("%d-%d", sg.start, sg.end)
-		var lastErr error
-		for try := 0; try < e.MaxTries; try++ {
-			if try > 0 {
-				time.Sleep(time.Duration(try) * time.Second)
-			}
-			if err := e.Streamer.Fetch(ctx, j.URL, sg.file, 0, rng); err != nil {
-				lastErr = err
-				os.Remove(sg.file)
-				continue
-			}
-			if fi, err := os.Stat(sg.file); err == nil && fi.Size() >= want {
-				return nil
-			}
+		if err := e.Streamer.Fetch(ctx, j.URL, sg.file, 0, rng); err != nil {
+			lastErr = err
 			os.Remove(sg.file)
-			lastErr = fmt.Errorf("segment short %d-%d", sg.start, sg.end)
+			continue
 		}
-		e.Streamer.MarkBadFor(j.URL) // MaxTries exhausted -> rotate relay off
-		return lastErr
+		if fi, err := os.Stat(sg.file); err == nil && fi.Size() >= want {
+			return nil
+		}
+		os.Remove(sg.file)
+		lastErr = fmt.Errorf("segment short %d-%d", sg.start, sg.end)
+	}
+	e.Streamer.MarkBadFor(j.URL) // MaxTries exhausted -> rotate relay off
+	return lastErr
+}
+
+// segOneDirect downloads one segment straight into the shared .part file at
+// its byte offset (direct-offset assembly). Per-segment resume progress comes
+// from the .meta sidecar: the shared file's size can't distinguish segments.
+func (e *Engine) segOneDirect(ctx context.Context, j Job, sg seg, part string) error {
+	want := sg.end - sg.start + 1
+	meta := segMetaPath(part, sg.idx)
+	have := readSegMeta(meta, want)
+	if have >= want {
+		return nil
 	}
 	var lastErr error
 	for try := 0; try < e.MaxTries; try++ {
@@ -421,38 +522,47 @@ func (e *Engine) segOne(ctx context.Context, st *Stats, j Job, sg struct {
 			continue
 		}
 		if resp.StatusCode == http.StatusOK {
-			// server ignored range: re-download whole segment
+			// Server ignored the Range: the body is the whole file. Restart
+			// the segment and position inside the body at this segment's start.
 			have = 0
-			os.Remove(sg.file)
+			if _, err := io.CopyN(io.Discard, resp.Body, sg.start); err != nil {
+				resp.Body.Close()
+				lastErr = err
+				continue
+			}
 		} else if resp.StatusCode != http.StatusPartialContent {
 			resp.Body.Close()
 			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 			continue
 		}
-		f, err := os.OpenFile(sg.file, os.O_CREATE|os.O_WRONLY, 0o644)
+		f, err := os.OpenFile(part, os.O_WRONLY, 0o644)
 		if err != nil {
 			resp.Body.Close()
 			return err
 		}
-		if have > 0 {
-			f.Seek(0, io.SeekEnd)
+		if _, err := f.Seek(sg.start+have, io.SeekStart); err != nil {
+			f.Close()
+			resp.Body.Close()
+			return err
 		}
-		_, cerr := io.Copy(f, resp.Body)
+		// cap at the segment's remaining range so an oversized body can't
+		// spill into the next segment's region
+		n, cerr := copyBytes(f, io.LimitReader(resp.Body, want-have))
 		f.Close()
 		resp.Body.Close()
+		have += n
+		if have > want {
+			have = want
+		}
+		writeSegMeta(meta, want, have)
+		if cerr == nil && have >= want {
+			return nil
+		}
 		if cerr == nil {
-			if fi, err := os.Stat(sg.file); err == nil && fi.Size() >= want {
-				return nil
-			}
-			if fi, err := os.Stat(sg.file); err == nil {
-				have = fi.Size()
-			}
+			lastErr = fmt.Errorf("segment short %d-%d", sg.start, sg.end)
 			continue
 		}
 		lastErr = cerr
-		if fi, err := os.Stat(sg.file); err == nil {
-			have = fi.Size()
-		}
 	}
 	return lastErr
 }
@@ -473,7 +583,7 @@ func (e *Engine) check(path string, j Job) bool {
 		return false
 	}
 	defer f.Close()
-	if _, err := io.Copy(h, f); err != nil {
+	if _, err := copyBytes(h, f); err != nil {
 		return false
 	}
 	got := hex.EncodeToString(h.Sum(nil))
