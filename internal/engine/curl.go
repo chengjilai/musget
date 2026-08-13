@@ -5,12 +5,17 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"math/rand"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
+
+	"musget/internal/utlsx"
 )
 
 // Relay tracks the health of one CORS relay base. Free-tier relays are
@@ -255,6 +260,33 @@ type CurlStreamer struct {
 	mu       sync.Mutex
 	cache    map[string]string // relayBase+"\x00"+archive.org URL -> resolved relay target
 	lastFail map[string]string // archive.org URL -> relay base of last failed fetch
+
+	parallelOnce sync.Once
+	parallelOK   bool
+}
+
+// SegSpec is one segment of a batched download: where curl writes it (Dest)
+// and the byte range to fetch (Rng, "start-end" inclusive).
+//
+// curl's -r/-H options are GLOBAL even under -Z: every URL in one invocation
+// gets the same range. So the batch cannot hand curl per-URL ranges directly;
+// instead each segment URL points at a per-job local batching server with the
+// range embedded in the path, and that server fetches the range from the
+// resolved relay-wrapped target over a shared Chrome-fingerprint connection.
+type SegSpec struct {
+	Dest string
+	Rng  string
+}
+
+// SupportsParallel reports whether the system curl was built with --parallel
+// (-Z). The engine uses the batched path only when it is available and falls
+// back to per-segment curl invocations otherwise.
+func (c *CurlStreamer) SupportsParallel() bool {
+	c.parallelOnce.Do(func() {
+		out, err := exec.Command("curl", "--help", "all").Output()
+		c.parallelOK = err == nil && strings.Contains(string(out), "--parallel")
+	})
+	return c.parallelOK
 }
 
 func NewCurlStreamer(bases ...string) *CurlStreamer {
@@ -390,6 +422,254 @@ func (c *CurlStreamer) Fetch(ctx context.Context, rawURL, dest string, off int64
 	// marks the relay bad via MarkBadFor.
 	c.Set.NoteSuccess(r.Base)
 	return nil
+}
+
+// FetchBatch downloads all segments of one job in a SINGLE curl -Z process
+// (--parallel), so the job pays one resolve and one relay connection instead
+// of N fetches. curl cannot apply per-URL ranges (-r is global), so the
+// batcher runs a per-job local HTTP server: each segment URL carries its
+// range in the path, curl streams it from there, and the server fetches the
+// range from the resolved relay-wrapped target over a shared
+// Chrome-fingerprint connection (utls) — one TLS handshake multiplexed
+// across every segment. A nonzero curl exit (any segment failed, e.g. the
+// relay returned a rate-limit page) fails the whole batch; the engine retries
+// with backoff and rotates the relay off via MarkBadFor after MaxTries.
+func (c *CurlStreamer) FetchBatch(ctx context.Context, rawURL string, segs []SegSpec) error {
+	if len(segs) == 0 {
+		return nil
+	}
+	r := c.Set.Pick()
+	if r == nil {
+		if c.Fallback != nil {
+			debugf("FALLBACK to WARP (batch %d segs): %s", len(segs), rawURL)
+			for _, sg := range segs {
+				if err := c.Fallback(ctx, rawURL, sg.Dest, 0, sg.Rng); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		return fmt.Errorf("all CORS relays unavailable (cooldown)")
+	}
+	target, err := c.resolve(ctx, r, rawURL)
+	if err != nil {
+		return err
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	bs := &batchServer{
+		target: target,
+		ua:     c.UA,
+		relay:  r,
+		set:    c.Set,
+		client: newRelayClient(),
+	}
+	srv := &http.Server{Handler: bs}
+	go srv.Serve(ln) //nolint:errcheck // closed via srv.Close below
+	debugf("batch %d segs relay=%s target=%s", len(segs), r.Base, truncStr(target, 70))
+	defer srv.Close()
+
+	args := []string{"-sS", "-f", "-Z", "--parallel-max", fmt.Sprint(len(segs)),
+		"--connect-timeout", "15", "-A", c.UA}
+	for _, sg := range segs {
+		args = append(args, "-o", sg.Dest, "http://"+ln.Addr().String()+"/r/"+sg.Rng)
+	}
+	cmd := exec.CommandContext(ctx, "curl", args...)
+	cmd.Env = append(os.Environ(), "CURL_HOME=/tmp")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if _, err := cmd.Output(); err != nil {
+		c.mu.Lock()
+		c.lastFail[rawURL] = r.Base
+		c.mu.Unlock()
+		// Relay-health classification happens inside the batch server (it
+		// sees the real backend error); curl's stderr only reflects the
+		// localhost hop, so do not classify from it here.
+		debugf("batch curl ERR %s err=%v stderr=%q url=%s", r.Base, err, truncStr(stderr.String(), 120), rawURL)
+		return fmt.Errorf("parallel curl %s: %v (%s)", truncStr(target, 60), err, truncStr(stderr.String(), 160))
+	}
+	return nil
+}
+
+// batchServer is the per-job local HTTP server that hands curl per-segment
+// ranges of one resolved relay target. All state here is per FetchBatch call,
+// so concurrent jobs never share mutable state. Relay failover markings use
+// the shared (mutex-protected) RelaySet exactly like Fetch does.
+type batchServer struct {
+	target string // relay-wrapped dn URL, resolved once per job
+	ua     string
+	relay  *Relay
+	set    *RelaySet
+	client *http.Client // shared backend client: one pooled connection per job
+}
+
+// progressReader records the last time bytes were observed so a watchdog can
+// detect a stalled relay (mirrors curl's --speed-limit/--speed-time abort).
+type progressReader struct {
+	r    io.Reader
+	mu   sync.Mutex
+	last time.Time
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.mu.Lock()
+		p.last = time.Now()
+		p.mu.Unlock()
+	}
+	return n, err
+}
+
+func (b *batchServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// path: /r/<start>-<end>
+	var start, end int64
+	if _, err := fmt.Sscanf(strings.TrimPrefix(r.URL.Path, "/r/"), "%d-%d", &start, &end); err != nil || end < start {
+		http.Error(w, "bad range", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	// Header guard: if the relay does not answer within 90s, abort. The body
+	// phase has its own stall watchdog below (no flat deadline, matching the
+	// single-stream path's --max-time 0).
+	hdDone := make(chan struct{})
+	go func() {
+		select {
+		case <-time.After(90 * time.Second):
+			cancel()
+		case <-hdDone:
+		}
+	}()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.target, nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+	req.Header.Set("User-Agent", b.ua)
+	resp, err := b.client.Do(req)
+	close(hdDone)
+	if err != nil {
+		b.backendErr(err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+		// 4xx/5xx from the relay = rate-limit/error page: rotate it off now
+		// (soft) so retries prefer another relay; it recovers after the short
+		// cooldown. 3xx is unexpected (resolve already followed it).
+		if resp.StatusCode >= 400 {
+			b.set.MarkBadSoft(b.relay.Base)
+			debugf("batch RELAY %d %s url=%s", resp.StatusCode, b.relay.Base, b.target)
+		}
+		http.Error(w, fmt.Sprintf("relay HTTP %d", resp.StatusCode), http.StatusBadGateway)
+		return
+	}
+	// A 200 means the server ignored the Range header (full body): stream it
+	// anyway; the engine's exact-size check catches the oversize segment and
+	// retries, exactly like the single-stream curl -r path.
+	pr := &progressReader{r: resp.Body, last: time.Now()}
+	// Body stall watchdog: abort (and rotate the relay off) if no bytes move
+	// for 15s. Armed once the response headers have arrived.
+	go func() {
+		<-hdDone // headers arrived (channel closed above)
+		t := time.NewTicker(3 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				pr.mu.Lock()
+				last := pr.last
+				pr.mu.Unlock()
+				if time.Since(last) > 15*time.Second {
+					b.set.MarkBadSoft(b.relay.Base)
+					debugf("batch STALL %s url=%s", b.relay.Base, b.target)
+					cancel() // aborts the backend request -> curl sees a broken stream
+					return
+				}
+			}
+		}
+	}()
+	if _, err := io.Copy(w, pr); err != nil {
+		// aborted (stall or ctx): curl -f fails this transfer, batch exits
+		// nonzero, engine retries. Nothing to write here.
+		return
+	}
+}
+
+// backendErr classifies a connection-level failure to the relay and marks it
+// for failover, mirroring the single-stream path's RelayHardFail handling
+// (rate-limit pages use the short soft cooldown, connection failures the
+// hard one).
+func (b *batchServer) backendErr(err error) {
+	s := strings.ToLower(err.Error())
+	for _, p := range []string{"no such host", "connection refused", "connection reset",
+		"eof", "handshake", "stream error", "connection closed", "no h2", "timed out"} {
+		if strings.Contains(s, p) {
+			b.set.MarkBad(b.relay.Base)
+			debugf("batch HARD %s err=%v url=%s", b.relay.Base, err, b.target)
+			return
+		}
+	}
+	debugf("batch ERR %s err=%v url=%s", b.relay.Base, err, b.target)
+}
+
+// newRelayClient returns the backend HTTP client for the relay-wrapped target.
+// Go's native TLS fingerprint is rejected (403) by the relays' Cloudflare
+// front, so TLS uses the repo's Chrome-fingerprint dialer (utlsx) and requests
+// are multiplexed over one HTTP/2 connection — the handshake savings this
+// batching exists for. Plain-HTTP targets (tests) use a stock transport.
+func newRelayClient() *http.Client {
+	h1 := &http.Transport{
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          16,
+		MaxIdleConnsPerHost:   8,
+		IdleConnTimeout:       2 * time.Minute,
+		TLSHandshakeTimeout:   20 * time.Second,
+		ResponseHeaderTimeout: 90 * time.Second,
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return utlsx.DialTLSContext(ctx, network, addr, nil)
+		},
+	}
+	h2 := utlsx.Transport()
+	return &http.Client{
+		Transport: &hybridRT{h2: h2, h1: h1},
+		// the relay-wrapped dn URL serves directly (no follow, like curl -f
+		// without -L); a 3xx here is an error the engine retries.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+}
+
+// hybridRT uses the multiplexing HTTP/2 transport for https targets and a
+// plain transport otherwise, falling back to plain TLS when the server does
+// not negotiate HTTP/2.
+type hybridRT struct {
+	h2 http.RoundTripper
+	h1 http.RoundTripper
+}
+
+func (rt *hybridRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Scheme != "https" {
+		return rt.h1.RoundTrip(req)
+	}
+	resp, err := rt.h2.RoundTrip(req)
+	if err == nil {
+		return resp, nil
+	}
+	// http2.Transport fails with "http2: unexpected ALPN protocol ..." when
+	// the server does not negotiate h2: fall back to plain TLS (h1) so the
+	// transfer still works. Match both "http2" and "http/2" spellings.
+	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "http2") || strings.Contains(s, "http/2") || strings.Contains(s, "alpn") {
+		return rt.h1.RoundTrip(req) // no h2 support: retry over h1 (utls TLS)
+	}
+	return resp, err
 }
 
 // MarkBadFor marks the relay that last failed for rawURL as bad. Called by
