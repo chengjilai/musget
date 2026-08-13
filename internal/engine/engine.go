@@ -288,9 +288,6 @@ func (e *Engine) stream(ctx context.Context, st *Stats, j Job, part string, off 
 		}
 	}
 	n, err := io.Copy(f, resp.Body)
-	if err == nil {
-		st.Bytes.Add(n)
-	}
 	return n, err
 }
 
@@ -435,11 +432,10 @@ func (e *Engine) segOne(ctx context.Context, st *Stats, j Job, sg struct{ start,
 		if have > 0 {
 			f.Seek(0, io.SeekEnd)
 		}
-		n, cerr := io.Copy(f, resp.Body)
+		_, cerr := io.Copy(f, resp.Body)
 		f.Close()
 		resp.Body.Close()
 		if cerr == nil {
-			st.Bytes.Add(n)
 			if fi, err := os.Stat(sg.file); err == nil && fi.Size() >= want {
 				return nil
 			}
