@@ -1,0 +1,55 @@
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+const usage = `musget — find & download music (archive.org, Gallica)
+
+Usage:
+  musget probe                     check which sources are reachable (direct/proxy)
+  musget search <query> [flags]    search for music
+  musget info <identifier>         show item metadata + files
+  musget get <identifier> [flags]  download an item's files (parallel, resumable)
+
+Flags:
+  --source archive|gallica|auto   source to search (default auto)
+  --limit N                       max search results (default 20)
+  --kind audio|score|all          file types to download (default all)
+  --file GLOB                     only files matching GLOB (repeatable)
+  --out DIR                       output directory (default ~/Music)
+  --jobs N                        parallel downloads (default 8)
+  --segments N                    split large files into N parallel ranges (default 0=off)
+  --segment-min MB                min size to use segmented download (default 25)
+  --verify                        verify sha1/md5 after download (default on)
+  --proxy URL                     proxy override (auto-detect if omitted)
+  --install                       organize under ~/Music/<Identifier>/
+  -q, --quiet                     less output
+`
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Print(usage)
+		os.Exit(1)
+	}
+	var err error
+	switch os.Args[1] {
+	case "probe":
+		err = cmdProbe(os.Args[2:])
+	case "search":
+		err = cmdSearch(os.Args[2:])
+	case "info":
+		err = cmdInfo(os.Args[2:])
+	case "get":
+		err = cmdGet(os.Args[2:])
+	case "help", "-h", "--help":
+		fmt.Print(usage)
+	default:
+		err = fmt.Errorf("unknown command %q", os.Args[1])
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+}
