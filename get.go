@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"musget/internal/archivex"
 	"musget/internal/engine"
 	"musget/internal/gallica"
 )
@@ -28,7 +27,7 @@ func cmdGet(args []string) error {
 	kind := fs.String("kind", "all", "audio|score|video|all")
 	fileGlobs := fs.String("file", "", "comma-separated file globs")
 	out := fs.String("out", "", "output dir (default ~/Music)")
-	jobs := fs.Int("jobs", 8, "parallel downloads")
+	jobs := fs.Int("jobs", 0, "parallel downloads (0 = auto)")
 	segments := fs.Int("segments", 0, "split big files into N parallel ranges (0=off)")
 	segMin := fs.Int64("segment-min", 25<<20, "min bytes for segmented download")
 	verify := fs.Bool("verify", true, "verify checksums")
@@ -51,16 +50,20 @@ func cmdGet(args []string) error {
 	}
 
 	p := *proxy
-	if p == "" {
-		p = resolveProxy("archive.org")
+	_ = p
+	ac, mode, corsBase, err := pickArchiveClient(ctx)
+	if err != nil {
+		return err
 	}
-	ac := archivex.NewClient(p)
+	if mode == modeCORS {
+		ac.Fetch = curlFetch(corsBase)
+	}
 	it, err := ac.Item(ctx, id)
 	if err != nil {
 		return err
 	}
 	if it.Title != "" && !*quiet {
-		fmt.Printf("item: %s — %s\n", it.Identifier, it.Title)
+		fmt.Printf("item: %s — %s (transport: %s)\n", it.Identifier, it.Title, mode)
 	}
 
 	var globs []*regexp.Regexp
@@ -131,14 +134,33 @@ func cmdGet(args []string) error {
 	if !*quiet {
 		fmt.Printf("%d files, %s\n", len(jobsList), humanSize(totalSize(jobsList)))
 	}
+	useJobs := *jobs
+	if useJobs <= 0 {
+		useJobs = 8
+		if mode == modeCORS {
+			useJobs = 16
+		}
+	}
 	eng := &engine.Engine{
-		Jobs:       *jobs,
+		Jobs:       useJobs,
 		Segments:   *segments,
 		SegmentMin: *segMin,
 		Verify:     *verify,
 		Quiet:      *quiet,
 		HTTP:       ac.HTTP,
 		MaxTries:   4,
+	}
+	// CORS relay handles parallel ranges well; default to segmented for big
+	// files unless the user chose otherwise. Transfers go through curl because
+	// the relay's Cloudflare rejects Go's TLS fingerprint.
+	if mode == modeCORS {
+		eng.Streamer = curlStreamer(corsBase)
+		if *segments == 0 {
+			eng.Segments = 4
+			if *segMin <= 0 {
+				eng.SegmentMin = 15 << 20
+			}
+		}
 	}
 	st := eng.Run(ctx, jobsList)
 	if st.FilesBad > 0 {

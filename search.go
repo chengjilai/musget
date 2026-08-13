@@ -55,35 +55,36 @@ func cmdSearch(args []string) error {
 	fs := flag.NewFlagSet("search", flag.ExitOnError)
 	limit := fs.Int("limit", 20, "max results")
 	src := fs.String("source", "auto", "archive|gallica")
-	proxy := fs.String("proxy", "", "proxy URL")
+	fs.StringVar(&proxyFlag, "proxy", "", "proxy URL (or cors:<relay>)")
 	fs.Parse(args[1:])
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	switch *src {
 	case "auto", "archive":
-		if *src == "auto" || *src == "archive" {
-			p := *proxy
-			if p == "" {
-				p = resolveProxy("archive.org")
+		ac, m, corsBase, err := pickArchiveClient(ctx)
+		if err != nil {
+			return err
+		}
+		if m == modeCORS {
+			ac.Fetch = curlFetch(corsBase)
+		}
+		fmt.Fprintf(os.Stderr, "[archive.org via %s]\n", m)
+		results, err := ac.Search(ctx, query, *limit)
+		if err != nil {
+			if *src == "archive" {
+				return err
 			}
-			ac := archivex.NewClient(p)
-			results, err := ac.Search(ctx, query, *limit)
-			if err != nil {
-				if *src == "archive" {
-					return err
-				}
-				fmt.Fprintln(os.Stderr, "archive.org search failed:", err)
-			} else {
-				printArchiveResults(results)
-				if *src == "archive" {
-					return nil
-				}
+			fmt.Fprintln(os.Stderr, "archive.org search failed:", err)
+		} else {
+			printArchiveResults(results)
+			if *src == "archive" {
+				return nil
 			}
 		}
 		// fall through to gallica when auto
 		if *src == "auto" {
-			gc := gallica.NewClient(*proxy)
+			gc := gallica.NewClient(proxyFlag)
 			hits, err := gc.Search(ctx, cqlFor(query), *limit)
 			if err != nil {
 				return fmt.Errorf("gallica: %w", err)
@@ -91,7 +92,7 @@ func cmdSearch(args []string) error {
 			printGallicaHits(hits)
 		}
 	case "gallica":
-		gc := gallica.NewClient(*proxy)
+		gc := gallica.NewClient(proxyFlag)
 		hits, err := gc.Search(ctx, cqlFor(query), *limit)
 		if err != nil {
 			return err
@@ -156,7 +157,10 @@ func cmdInfo(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	ac := archivex.NewClient(p)
+	ac, _, _, err := pickArchiveClient(ctx)
+	if err != nil {
+		return err
+	}
 	it, err := ac.Item(ctx, id)
 	if err != nil {
 		return err

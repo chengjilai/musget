@@ -10,40 +10,61 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"musget/internal/corsx"
 )
 
 const Base = "https://archive.org"
 
-// Client talks to archive.org. Proxy may be "" for direct.
+// Client talks to archive.org. Transport may be a custom RoundTripper
+// (e.g. corsx relay or WARP proxy wrapper). Fetch overrides the transport
+// for API calls (used when the relay rejects Go's TLS fingerprint).
 type Client struct {
-	HTTP *http.Client
+	HTTP  *http.Client
+	Fetch func(ctx context.Context, u string) ([]byte, error)
 }
 
-func NewClient(proxy string) *Client {
-	return &Client{HTTP: newHTTP(proxy)}
+// NewDirectClient builds a client that talks to archive.org directly.
+func NewDirectClient() *Client {
+	return &Client{HTTP: &http.Client{Transport: tunedTransport(""), Timeout: 120 * time.Second}}
 }
 
-func newHTTP(proxy string) *http.Client {
+// NewProxyClient builds a client through the given HTTP proxy.
+func NewProxyClient(proxy string) *Client {
+	return &Client{HTTP: &http.Client{Transport: tunedTransport(proxy), Timeout: 120 * time.Second}}
+}
+
+// NewCORSClient builds a client routed through a CORS relay (corsx base).
+func NewCORSClient(base string) *Client {
+	tr := corsx.NewTransport(base, tunedTransport(""))
+	return &Client{HTTP: &http.Client{Transport: tr, Timeout: 0}}
+}
+
+func tunedTransport(proxy string) *http.Transport {
 	var tr *http.Transport
 	if proxy != "" {
 		tr = &http.Transport{
-			ForceAttemptHTTP2: true,
-			MaxIdleConns:      256,
-			MaxIdleConnsPerHost: 64,
-			IdleConnTimeout:   2 * time.Minute,
+			ForceAttemptHTTP2:    true,
+			MaxIdleConns:         256,
+			MaxIdleConnsPerHost:  64,
+			IdleConnTimeout:      2 * time.Minute,
+			TLSHandshakeTimeout:  10 * time.Second,
+			ResponseHeaderTimeout: 90 * time.Second,
 		}
 		if u, err := url.Parse(proxy); err == nil {
 			tr.Proxy = http.ProxyURL(u)
 		}
 	} else {
 		tr = &http.Transport{
-			ForceAttemptHTTP2: true,
-			MaxIdleConns:      256,
-			MaxIdleConnsPerHost: 64,
-			IdleConnTimeout:   2 * time.Minute,
+			ForceAttemptHTTP2:    true,
+			MaxIdleConns:         256,
+			MaxIdleConnsPerHost:  64,
+			IdleConnTimeout:      2 * time.Minute,
+			TLSHandshakeTimeout:  10 * time.Second,
+			ResponseHeaderTimeout: 90 * time.Second,
 		}
 	}
-	return &http.Client{Transport: tr, Timeout: 120 * time.Second}
+	return tr
 }
 
 // Result is one search hit.
@@ -160,6 +181,9 @@ func (c *Client) DownloadURL(id, name string) string {
 }
 
 func (c *Client) get(ctx context.Context, u string) ([]byte, error) {
+	if c.Fetch != nil {
+		return c.Fetch(ctx, u)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err

@@ -37,6 +37,7 @@ type Engine struct {
 	Verify     bool
 	Quiet      bool
 	HTTP       *http.Client
+	Streamer   *CurlStreamer // if set, transfers go through curl (relay path)
 	MaxTries   int
 }
 
@@ -203,6 +204,29 @@ func (e *Engine) single(ctx context.Context, st *Stats, j Job, part string) erro
 			case <-time.After(time.Duration(try) * time.Second):
 			}
 		}
+		if e.Streamer != nil {
+			if err := e.Streamer.Fetch(ctx, j.URL, part, off, ""); err != nil {
+				lastErr = err
+				if fi, err2 := os.Stat(part); err2 == nil {
+					off = fi.Size()
+				}
+				continue
+			}
+			if j.Size > 0 {
+				fi, err2 := os.Stat(part)
+				if err2 == nil && fi.Size() == j.Size {
+					return nil
+				}
+				if err2 == nil {
+					if fi.Size() > off {
+						off = fi.Size()
+					}
+					lastErr = fmt.Errorf("short download: %d/%d", fi.Size(), j.Size)
+					continue
+				}
+			}
+			return nil
+		}
 		n, err := e.stream(ctx, st, j, part, off)
 		if err == nil {
 			// ensure full size
@@ -352,6 +376,31 @@ func (e *Engine) segOne(ctx context.Context, st *Stats, j Job, sg struct{ start,
 	if have >= want {
 		st.Bytes.Add(want)
 		return nil
+	}
+	if e.Streamer != nil {
+		// curl path: restart the whole segment on partial (curl cannot append)
+		if have > 0 {
+			os.Remove(sg.file)
+		}
+		rng := fmt.Sprintf("%d-%d", sg.start, sg.end)
+		var lastErr error
+		for try := 0; try < e.MaxTries; try++ {
+			if try > 0 {
+				time.Sleep(time.Duration(try) * time.Second)
+			}
+			if err := e.Streamer.Fetch(ctx, j.URL, sg.file, 0, rng); err != nil {
+				lastErr = err
+				os.Remove(sg.file)
+				continue
+			}
+			if fi, err := os.Stat(sg.file); err == nil && fi.Size() >= want {
+				st.Bytes.Add(want)
+				return nil
+			}
+			os.Remove(sg.file)
+			lastErr = fmt.Errorf("segment short %d-%d", sg.start, sg.end)
+		}
+		return lastErr
 	}
 	var lastErr error
 	for try := 0; try < e.MaxTries; try++ {
