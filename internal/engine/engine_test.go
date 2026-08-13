@@ -237,6 +237,137 @@ func sum64(s []int64) int64 {
 	return t
 }
 
+func mkOutcome(ok bool, mb float64) jobOutcome {
+	return jobOutcome{bytes: int64(mb * 1e6), dur: time.Second, ok: ok}
+}
+
+// TestPoolDecisionDec: a sustained collapse (majority failures + throughput
+// drop) fires exactly one DEC, and never on sparse failures or rising
+// throughput.
+func TestPoolDecisionDec(t *testing.T) {
+	win := make([]jobOutcome, aimdWindow)
+	for i := range win {
+		win[i] = mkOutcome(true, 1)
+	}
+	// 5 fails / 10 = 0.5 failure rate: NOT > 0.5 -> no DEC (dead relay in a
+	// rotation produces exactly this alternating pattern).
+	for i := 1; i < len(win); i += 2 {
+		win[i] = mkOutcome(false, 0)
+	}
+	if _, act, _ := poolDecision(win, 20.0, 0); act == poolDec {
+		t.Fatal("50%% failure rate must not DEC")
+	}
+	// 6 fails / 10 with throughput collapse -> exactly one DEC
+	win[0] = mkOutcome(false, 0)
+	tp, act, cd := poolDecision(win, 20.0, 0)
+	if act != poolDec {
+		t.Fatalf("action = %d, want poolDec (tp=%.2f)", act, tp)
+	}
+	if cd != aimdWindow {
+		t.Fatalf("post-DEC cooldown = %d, want %d", cd, aimdWindow)
+	}
+	// DEC is gated on throughput actually dropping
+	if _, act, _ := poolDecision(win, 0.4, 0); act == poolDec {
+		t.Fatal("throughput not dropped -> no DEC")
+	}
+	// at most one DEC per window: cooldown still active
+	if _, act, _ := poolDecision(win, 20.0, aimdWindow-1); act == poolDec {
+		t.Fatal("DEC fired during cooldown")
+	}
+}
+
+// TestPoolDecisionSparseFailsNoDec: a single isolated failure in an
+// otherwise healthy window must never shrink the pool.
+func TestPoolDecisionSparseFailsNoDec(t *testing.T) {
+	win := make([]jobOutcome, aimdWindow)
+	for i := range win {
+		win[i] = mkOutcome(true, 1)
+	}
+	win[0] = mkOutcome(false, 0)
+	if _, act, _ := poolDecision(win, 20.0, 0); act == poolDec {
+		t.Fatal("a single failure must not DEC the pool")
+	}
+}
+
+// TestPoolDecisionInc: clean rising windows grow the pool, short windows
+// don't.
+func TestPoolDecisionInc(t *testing.T) {
+	win := make([]jobOutcome, aimdWindow)
+	for i := range win {
+		win[i] = mkOutcome(true, 2)
+	}
+	if _, act, _ := poolDecision(win, 1.0, 0); act != poolInc {
+		t.Fatal("clean rising window must INC")
+	}
+	if _, act, _ := poolDecision(win[:aimdWindow/2], 1.0, 0); act == poolInc {
+		t.Fatal("half-full window must not INC")
+	}
+}
+
+// TestDecDesiredFloor: halving never goes below the floor and never raises
+// desired.
+func TestDecDesiredFloor(t *testing.T) {
+	if decDesired(16, 8) != 8 {
+		t.Fatal("16 halved to 8")
+	}
+	if decDesired(8, 8) != 8 {
+		t.Fatal("at floor stays put")
+	}
+	if decDesired(7, 8) != 7 {
+		t.Fatal("floor never raises desired")
+	}
+	if decDesired(16, 2) != 8 {
+		t.Fatal("normal halving")
+	}
+}
+
+// TestAdaptivePoolFlaky runs jobs against a server that permanently fails
+// every even-indexed job (~50%% of the batch, the dead-relay-in-rotation
+// pattern): the pool must not collapse and every job must be accounted for.
+func TestAdaptivePoolFlaky(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var id int64
+		fmt.Sscanf(r.URL.Query().Get("id"), "%d", &id)
+		if id%2 == 0 {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Length", "1048576")
+		w.Write(make([]byte, 1048576))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	var jobs []Job
+	for i := 0; i < 24; i++ {
+		jobs = append(jobs, Job{
+			Name: fmt.Sprintf("flaky%d", i),
+			URL:  fmt.Sprintf("%s/?id=%d", srv.URL, i),
+			Dest: filepath.Join(dir, fmt.Sprintf("flaky%d", i)),
+			Size: 1 << 20,
+		})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	e := &Engine{
+		Jobs:     8,
+		Adaptive: true,
+		MinJobs:  2,
+		MaxJobs:  16,
+		Verify:   false,
+		Quiet:    true,
+		HTTP:     srv.Client(),
+		MaxTries: 2,
+	}
+	st := e.Run(ctx, jobs)
+	if st.FilesOK+st.FilesBad != len(jobs) {
+		t.Fatalf("accounted ok=%d bad=%d want %d", st.FilesOK, st.FilesBad, len(jobs))
+	}
+	if st.FilesBad == 0 || st.FilesOK == 0 {
+		t.Fatalf("flaky server should split outcomes, got ok=%d bad=%d", st.FilesOK, st.FilesBad)
+	}
+}
+
 // TestSegmentedConcatenation sanity: segmented transfer over the fake server
 // produces a correct, verifiable file (no checksum, just size).
 func TestSegmentedConcatenation(t *testing.T) {

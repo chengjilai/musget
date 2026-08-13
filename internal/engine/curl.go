@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"strings"
@@ -19,12 +20,58 @@ type Relay struct {
 	Base  string  // relay base URL, e.g. https://proxy.cors.sh
 	Speed float64 // MB/s measured at startup probe
 
+	// failure history (guarded by RelaySet.mu): feeds Pick's weighted
+	// selection so recently-flaky relays stay out of the hot path.
+	lastFailTime     time.Time
+	consecutiveFails int
+	successCount     int64
+
 	mu       sync.Mutex
 	badUntil time.Time
 }
 
 func (r *Relay) badLocked(now time.Time) bool  { return now.Before(r.badUntil) }
 func (r *Relay) markBadLocked(d time.Duration) { r.badUntil = time.Now().Add(d) }
+
+// noteFailLocked records a failure event (any cooldown mark). Callers hold
+// RelaySet.mu.
+func (r *Relay) noteFailLocked() {
+	r.consecutiveFails++
+	r.lastFailTime = time.Now()
+}
+
+// noteSuccessLocked records a successful transfer: the streak resets so a
+// relay that recovers rejoins the healthy rotation as an equal candidate.
+// Callers hold RelaySet.mu.
+func (r *Relay) noteSuccessLocked() {
+	r.successCount++
+	r.consecutiveFails = 0
+	r.lastFailTime = time.Time{}
+}
+
+// pickScore returns a lower-is-better health score for r at time now.
+// Relays with no failure history score 0; each consecutive failure adds 1,
+// and a recent failure adds a decaying recency penalty (up to ~0.9 extra
+// for a failure moments ago, fading over one minute) so a relay that just
+// flaked ranks strictly worse than one that failed long ago. Callers hold
+// RelaySet.mu.
+func (r *Relay) pickScore(now time.Time) float64 {
+	if r.consecutiveFails == 0 && r.lastFailTime.IsZero() {
+		return 0
+	}
+	s := float64(r.consecutiveFails)
+	if !r.lastFailTime.IsZero() {
+		age := now.Sub(r.lastFailTime)
+		if age < 0 {
+			age = 0
+		}
+		const decay = time.Minute
+		if age < decay {
+			s += (1 - float64(age)/float64(decay)) * 0.9
+		}
+	}
+	return s
+}
 
 // RelaySet manages a set of relays: round-robin rotation among healthy ones,
 // cooldown-based failover, and per-relay startup speed measurements.
@@ -91,6 +138,7 @@ func (s *RelaySet) MarkBad(base string) {
 	for _, r := range s.relays {
 		if r.Base == base {
 			r.markBadLocked(s.Cooldown)
+			r.noteFailLocked()
 		}
 	}
 }
@@ -105,6 +153,20 @@ func (s *RelaySet) MarkBadSoft(base string) {
 	for _, r := range s.relays {
 		if r.Base == base {
 			r.markBadLocked(s.SoftCooldown)
+			r.noteFailLocked()
+		}
+	}
+}
+
+// NoteSuccess records a successful transfer through relay base: it resets
+// the consecutive-failure streak so a recovered relay rejoins the healthy
+// rotation.
+func (s *RelaySet) NoteSuccess(base string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.relays {
+		if r.Base == base {
+			r.noteSuccessLocked()
 		}
 	}
 }
@@ -126,8 +188,12 @@ func (s *RelaySet) Healthy() []string {
 // AllBad reports whether every relay is in cooldown.
 func (s *RelaySet) AllBad() bool { return len(s.Healthy()) == 0 }
 
-// Pick returns the next healthy relay in round-robin order, skipping any in
-// cooldown; returns nil if all relays are bad.
+// Pick returns the healthiest relay not in cooldown: relays with recent
+// failures (pickScore) rank below clean ones, and among equal scores the
+// faster relay wins; exact ties rotate round-robin. A small random nudge
+// occasionally exercises a degraded-but-healthy relay so its history can
+// refresh instead of starving forever. Returns nil if every relay is in
+// cooldown.
 func (s *RelaySet) Pick() *Relay {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -136,14 +202,43 @@ func (s *RelaySet) Pick() *Relay {
 		return nil
 	}
 	now := time.Now()
+	best := -1
+	var bestScore, bestSpeed float64
 	for i := 0; i < n; i++ {
-		r := s.relays[(s.next+i)%n]
-		if !r.badLocked(now) {
-			s.next = (s.next + i + 1) % n
-			return r
+		idx := (s.next + i) % n
+		r := s.relays[idx]
+		if r.badLocked(now) {
+			continue
+		}
+		sc := r.pickScore(now)
+		if best < 0 || sc < bestScore || (sc == bestScore && r.Speed > bestSpeed) {
+			best, bestScore, bestSpeed = idx, sc, r.Speed
 		}
 	}
-	return nil
+	if best < 0 {
+		return nil
+	}
+	// Tiny randomness: when the best relay is clean but another healthy
+	// relay is degraded, ~8% of picks try a degraded one so a relay that has
+	// recovered (or a dead one that should stay marked) gets exercised and
+	// its history refreshes. A fully clean set rotates deterministically.
+	if bestScore == 0 {
+		var degraded []int
+		for i := 0; i < n; i++ {
+			idx := (s.next + i) % n
+			r := s.relays[idx]
+			if !r.badLocked(now) && r.pickScore(now) > 0 {
+				degraded = append(degraded, idx)
+			}
+		}
+		if len(degraded) > 0 && rand.Intn(100) < 8 {
+			idx := degraded[rand.Intn(len(degraded))]
+			s.next = (idx + 1) % n
+			return s.relays[idx]
+		}
+	}
+	s.next = (best + 1) % n
+	return s.relays[best]
 }
 
 // CurlStreamer downloads via curl subprocesses, used for CORS-relay paths
@@ -293,6 +388,7 @@ func (c *CurlStreamer) Fetch(ctx context.Context, rawURL, dest string, off int64
 	// here: the engine detects the short download and retries, which usually
 	// recovers immediately. Persistent empties hit MaxTries exhaustion, which
 	// marks the relay bad via MarkBadFor.
+	c.Set.NoteSuccess(r.Base)
 	return nil
 }
 

@@ -50,40 +50,40 @@ type relayProbe struct {
 // direct, then a CORS relay (mainland-China friendly, ~15 MB/s), then an
 // HTTP proxy (e.g. WARP smart-proxy, ~1 MB/s). In CORS mode it returns the
 // healthy relay bases ordered fastest-first for per-job rotation.
-func pickArchiveClient(ctx context.Context) (client *archivex.Client, m mode, bases []string, err error) {
+func pickArchiveClient(ctx context.Context) (client *archivex.Client, m mode, bases []string, speeds map[string]float64, err error) {
 	if relayFlag != "" {
 		base := corsx.CanonicalBase(relayFlag)
 		if base == "" {
-			return nil, 0, nil, fmt.Errorf("unknown relay %q (want URL or one of: %s)",
+			return nil, 0, nil, nil, fmt.Errorf("unknown relay %q (want URL or one of: %s)",
 				relayFlag, strings.Join(relayNames(), ", "))
 		}
-		return archivex.NewDirectClient(), modeCORS, []string{base}, nil
+		return archivex.NewDirectClient(), modeCORS, []string{base}, nil, nil
 	}
 	if strings.HasPrefix(proxyFlag, "cors:") {
 		base := strings.TrimPrefix(proxyFlag, "cors:")
 		if base == "" {
 			base = corsx.Bases[0]
 		}
-		return archivex.NewDirectClient(), modeCORS, []string{base}, nil
+		return archivex.NewDirectClient(), modeCORS, []string{base}, nil, nil
 	}
 	if proxyFlag != "" {
-		return archivex.NewProxyClient(proxyFlag), modeProxy, nil, nil
+		return archivex.NewProxyClient(proxyFlag), modeProxy, nil, nil, nil
 	}
 	direct := archivex.NewDirectClient()
 	if code, ok := netx.Reachable(direct.HTTP, "https://archive.org/metadata/faure-nocturnes-1-8", 8*time.Second); ok && code < 500 {
-		return direct, modeDirect, nil, nil
+		return direct, modeDirect, nil, nil, nil
 	}
 	// relay reachable? probe both with a ranged request, pick the fastest.
-	if b := relayBases(ctx); len(b) > 0 {
-		return archivex.NewDirectClient(), modeCORS, b, nil
+	if b, sp := relayBases(ctx); len(b) > 0 {
+		return archivex.NewDirectClient(), modeCORS, b, sp, nil
 	}
 	if p := netx.EnvProxy(); p != "" {
-		return archivex.NewProxyClient(p), modeProxy, nil, nil
+		return archivex.NewProxyClient(p), modeProxy, nil, nil, nil
 	}
 	if p, err := netx.DetectProxy("archive.org", 10*time.Second); err == nil && p != "" {
-		return archivex.NewProxyClient(p), modeProxy, nil, nil
+		return archivex.NewProxyClient(p), modeProxy, nil, nil, nil
 	}
-	return direct, modeDirect, nil, nil
+	return direct, modeDirect, nil, nil, nil
 }
 
 // relayNames returns the --relay aliases for error messages.
@@ -100,6 +100,9 @@ func relayNames() []string {
 // (-r 0-1048575, 5s timeout), measuring bytes/sec, and returns the healthy
 // ones sorted fastest-first. curl is used because the relays' Cloudflare
 // front rejects Go's TLS fingerprint. All relays are probed concurrently.
+// Dead relays never make the cut: any non-2xx response, error exit or empty
+// body marks the probe failed, so a relay that's down (or 429ing) at startup
+// is excluded from the set entirely.
 func probeRelays(ctx context.Context, bases []string) []relayProbe {
 	probes := make([]relayProbe, len(bases))
 	var wg sync.WaitGroup
@@ -124,9 +127,11 @@ func probeRelays(ctx context.Context, bases []string) []relayProbe {
 func probeOneRelay(ctx context.Context, base string) relayProbe {
 	p := relayProbe{base: base}
 	// a stable, non-redirecting archive.org endpoint big enough to
-	// measure throughput over ~1MB.
+	// measure throughput over ~1MB. -f makes curl exit non-zero on any
+	// HTTP 4xx/5xx (e.g. a 429 rate-limit page), so dead relays are
+	// rejected on the exit code instead of being parsed as healthy.
 	u := base + "/https://archive.org/advancedsearch.php?q=date:[1900-01-01+TO+1901-01-01]&rows=1000&output=json"
-	cmd := exec.CommandContext(ctx, "curl", "-sS", "-g", "-o", "/dev/null",
+	cmd := exec.CommandContext(ctx, "curl", "-sS", "-g", "-f", "-o", "/dev/null",
 		"-w", "%{http_code} %{size_download} %{speed_download}",
 		"--connect-timeout", "5", "--max-time", "10", "-A", "curl",
 		"-r", "0-1048575", u)
@@ -154,24 +159,33 @@ func probeOneRelay(ctx context.Context, base string) relayProbe {
 	return p
 }
 
-// relayBases returns healthy relay bases ordered fastest-first, or nil.
-func relayBases(ctx context.Context) []string {
+// relayBases returns healthy relay bases ordered fastest-first plus their
+// measured speeds (base -> MB/s); nil if none are reachable.
+func relayBases(ctx context.Context) ([]string, map[string]float64) {
 	probes := probeRelays(ctx, corsx.Bases)
 	var out []string
+	speeds := make(map[string]float64)
 	for _, p := range probes {
 		if p.ok {
 			out = append(out, p.base)
+			speeds[p.base] = p.speed
 		}
 	}
-	return out
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, speeds
 }
 
 // curlFetch returns an API fetch function that goes through the relay via
 // curl (Cloudflare rejects Go's TLS fingerprint on the relay). Relays are
 // rotated, bad ones skipped, and when every relay fails it falls back to the
 // WARP smart-proxy (also via curl).
-func curlFetch(bases []string) func(ctx context.Context, u string) ([]byte, error) {
+func curlFetch(bases []string, speeds map[string]float64) func(ctx context.Context, u string) ([]byte, error) {
 	set := engine.NewRelaySet(bases...)
+	for b, mbps := range speeds {
+		set.SetSpeed(b, mbps)
+	}
 	return func(ctx context.Context, u string) ([]byte, error) {
 		for i := 0; i <= len(bases); i++ {
 			r := set.Pick()
@@ -205,11 +219,14 @@ func curlFetch(bases []string) func(ctx context.Context, u string) ([]byte, erro
 	}
 }
 
-// curlStreamer returns a relay streamer over the healthy bases (rotating per
-// job/segment), with the WARP proxy as the last-resort fallback when every
-// relay is in cooldown.
-func curlStreamer(bases []string) *engine.CurlStreamer {
+// curlStreamer returns a relay streamer over the healthy bases (weighted
+// pick: fast/clean relays first, cooldowns skipped), with the WARP proxy as
+// the last-resort fallback when every relay is in cooldown.
+func curlStreamer(bases []string, speeds map[string]float64) *engine.CurlStreamer {
 	cs := engine.NewCurlStreamer(bases...)
+	for b, mbps := range speeds {
+		cs.Set.SetSpeed(b, mbps)
+	}
 	cs.Fallback = warpFallback
 	return cs
 }

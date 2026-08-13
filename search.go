@@ -63,12 +63,12 @@ func cmdSearch(args []string) error {
 
 	switch *src {
 	case "auto", "archive":
-		ac, m, bases, err := pickArchiveClient(ctx)
+		ac, m, bases, speeds, err := pickArchiveClient(ctx)
 		if err != nil {
 			return err
 		}
 		if m == modeCORS {
-			ac.Fetch = curlFetch(bases)
+			ac.Fetch = curlFetch(bases, speeds)
 		}
 		fmt.Fprintf(os.Stderr, "[archive.org via %s]\n", m)
 		results, err := ac.Search(ctx, query, *limit)
@@ -158,12 +158,12 @@ func cmdInfo(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	ac, m, bases, err := pickArchiveClient(ctx)
+	ac, m, bases, speeds, err := pickArchiveClient(ctx)
 	if err != nil {
 		return err
 	}
 	if m == modeCORS {
-		ac.Fetch = curlFetch(bases)
+		ac.Fetch = curlFetch(bases, speeds)
 	}
 	it, err := ac.Item(ctx, id)
 	if err != nil {

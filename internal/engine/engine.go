@@ -114,6 +114,13 @@ func (e *Engine) Run(ctx context.Context, jobs []Job) Stats {
 			maxJ = 64
 		}
 	}
+	// decFloor is the pool's hard shrink floor: even a sustained collapse
+	// never takes the pool below max(2, initial/2), so one dead relay can't
+	// collapse the download rate.
+	decFloor := minJ
+	if f := max(2, e.Jobs/2); f > decFloor {
+		decFloor = f
+	}
 
 	jobCh := make(chan Job)
 	// outcomeCh carries per-job results to the coordinator (sized so workers
@@ -125,6 +132,7 @@ func (e *Engine) Run(ctx context.Context, jobs []Job) Stats {
 	desired := int32(e.Jobs)
 	window := make([]jobOutcome, 0, aimdWindow)
 	var prevTp float64
+	var decCooldown int // outcomes until the next pool DEC is allowed
 
 	var wg sync.WaitGroup
 	worker := func() {
@@ -197,34 +205,24 @@ func (e *Engine) Run(ctx context.Context, jobs []Job) Stats {
 		if len(window) > aimdWindow {
 			window = window[1:]
 		}
-		var tb int64
-		var td time.Duration
-		fails := 0
-		for _, w := range window {
-			tb += w.bytes
-			td += w.dur
-			if !w.ok {
-				fails++
-			}
-		}
-		tp := 0.0
-		if td > 0 {
-			tp = float64(tb) / 1e6 / td.Seconds()
-		}
-		rising := prevTp > 0 && tp > prevTp*1.05
+		var tp float64
+		var action int
+		tp, action, decCooldown = poolDecision(window, prevTp, decCooldown)
 		prevTp = tp
-		if fails > 0 {
-			// AIMD multiplicative decrease on failure, bounded below
-			d := int(desired) / 2
-			if d < minJ {
-				d = minJ
+		switch action {
+		case poolDec:
+			// sustained throughput collapse: halve, but never below decFloor
+			d := decDesired(int(desired), decFloor)
+			if d < int(desired) {
+				desired = int32(d)
+				debugf("pool DEC desired=%d cur=%d (sustained collapse)", desired, cur)
 			}
-			desired = int32(d)
-			debugf("pool DEC desired=%d cur=%d (fail)", desired, cur)
-		} else if rising && len(window) >= aimdWindow && int(desired) < maxJ {
+		case poolInc:
 			// additive increase only when throughput is rising and clean
-			desired++
-			debugf("pool INC desired=%d cur=%d tp=%.2f", desired, cur, tp)
+			if int(desired) < maxJ {
+				desired++
+				debugf("pool INC desired=%d cur=%d tp=%.2f", desired, cur, tp)
+			}
 		}
 		// grow the pool toward desired while jobs remain to be dispatched
 		for cur < desired && !abort && sent < len(jobs) {
@@ -280,8 +278,65 @@ type jobOutcome struct {
 }
 
 // aimdWindow is the sliding window of recent job results the adaptive pool
-// uses to estimate throughput and failure rate.
-const aimdWindow = 5
+// uses to estimate throughput and failure rate. Sized up so individual job
+// failures don't dominate the decision: one dead relay in a rotation yields
+// roughly 50% failures, which must never trigger a DEC.
+const aimdWindow = 10
+
+// Pool actions returned by poolDecision.
+const (
+	poolNone = iota
+	poolDec
+	poolInc
+)
+
+// poolDecision evaluates the sliding window of recent job outcomes and
+// returns the next pool action plus the window's aggregate throughput
+// (MB/s). DEC fires only on a sustained throughput collapse — more than
+// half the window failed AND throughput actually dropped vs the previous
+// window — and at most once per aimdWindow outcomes. Individual failures
+// (e.g. one dead relay in rotation) never shrink the pool.
+func poolDecision(window []jobOutcome, prevTp float64, decCooldown int) (tp float64, action int, nextCooldown int) {
+	nextCooldown = decCooldown
+	if nextCooldown > 0 {
+		nextCooldown--
+	}
+	var tb int64
+	var td time.Duration
+	fails := 0
+	for _, w := range window {
+		tb += w.bytes
+		td += w.dur
+		if !w.ok {
+			fails++
+		}
+	}
+	if td > 0 {
+		tp = float64(tb) / 1e6 / td.Seconds()
+	}
+	if len(window) >= aimdWindow/2 && fails*2 > len(window) &&
+		prevTp > 0 && tp < prevTp && nextCooldown == 0 {
+		return tp, poolDec, aimdWindow
+	}
+	if prevTp > 0 && tp > prevTp*1.05 && len(window) >= aimdWindow {
+		return tp, poolInc, nextCooldown
+	}
+	return tp, poolNone, nextCooldown
+}
+
+// decDesired halves desired but never below floor, so the adaptive pool
+// can't collapse below max(2, initial/2) even under sustained failure. It
+// never raises desired.
+func decDesired(desired, floor int) int {
+	if desired <= floor {
+		return desired
+	}
+	d := desired / 2
+	if d < floor {
+		return floor
+	}
+	return d
+}
 
 func (e *Engine) render(st *Stats) {
 	el := st.elapsed()

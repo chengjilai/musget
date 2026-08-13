@@ -64,12 +64,12 @@ func cmdGet(args []string) error {
 	p := *proxy
 	_ = p
 	relayFlag = *relay
-	ac, mode, bases, err := pickArchiveClient(ctx)
+	ac, mode, bases, speeds, err := pickArchiveClient(ctx)
 	if err != nil {
 		return err
 	}
 	if mode == modeCORS {
-		ac.Fetch = curlFetch(bases)
+		ac.Fetch = curlFetch(bases, speeds)
 	}
 	it, err := ac.Item(ctx, id)
 	if err != nil {
@@ -167,7 +167,7 @@ func cmdGet(args []string) error {
 	// files unless the user chose otherwise. Transfers go through curl because
 	// the relay's Cloudflare rejects Go's TLS fingerprint.
 	if mode == modeCORS {
-		eng.Streamer = curlStreamer(bases)
+		eng.Streamer = curlStreamer(bases, speeds)
 		eng.Adaptive = true
 		if !segmentsSet {
 			// size-bucket segment counts (8-40MB:2, >40MB:4, >120MB:6); the
